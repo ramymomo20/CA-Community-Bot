@@ -38,103 +38,122 @@ def normalize_value(value, min_val, max_val):
     return (value - min_val) / (max_val - min_val)
 
 def get_mvp(player_stats):
-    """Calculate MVP using weighted position-specific stats."""
+    """
+    Calculate MVP using a more realistic, position-aware, impact-based scoring system.
+    """
     if not player_stats:
         return "No data available"
-    
-    # Define weights for each position
+
+    # Define stat weights for each position
     WEIGHTS = {
         'GK': {
-            'keeperSaves': 0.4,
-            'cleanSheets': 0.3,
-            'passesCompleted': 0.2,
-            'assists': 0.05,
+            'keeperSaves': 0.25,
+            'keeperSavesCaught': 0.10,
+            'cleanSheets': 0.25,
+            'passesCompleted': 0.10,
+            'assists': 0.10,
             'secondAssists': 0.05,
+            'goalsConceded': -0.40,  # negative weight
         },
         'DEF': {  # LB, CB, RB
-            'interceptions': 0.3,
-            'slideTackles': 0.3,
+            'interceptions': 0.25,
+            'slidingTacklesCompleted': 0.25,
             'passesCompleted': 0.15,
-            'assists': 0.1,
-            'secondAssists': 0.1,
-            'goals': 0.05
+            'assists': 0.15,
+            'secondAssists': 0.10,
+            'goals': 0.15,  # rare, so more valuable
+            'keyPasses': 0.05
         },
         'MID': {  # CM
-            'passesCompleted': 0.3,
-            'keyPasses': 0.2,
-            'assists': 0.2,
-            'goals': 0.2,
-            'secondAssists': 0.1        
+            'passesCompleted': 0.25,
+            'keyPasses': 0.30,
+            'assists': 0.25,
+            'goals': 0.25,
+            'secondAssists': 0.15,
+            'interceptions': 0.15,
+            'slidingTacklesCompleted': 0.10,
+            'shotsOnGoal': 0.05,
         },
         'FWD': {  # LW, CF, RW
-            'goals': 0.4,
-            'assists': 0.2,
-            'shotsOnGoal': 0.2,
-            'keyPasses': 0.1,
-            'secondAssists': 0.1
+            'goals': 0.35,
+            'assists': 0.25,
+            'shotsOnGoal': 0.10,
+            'keyPasses': 0.15,
+            'secondAssists': 0.15,
+            'passesCompleted': 0.05,
+            'interceptions': 0.05,
         }
     }
-    
-    # Group players by position category
+
+    # Map positions to categories
     position_categories = {
         'GK': ['GK'],
         'DEF': ['LB', 'CB', 'RB'],
         'MID': ['CM'],
         'FWD': ['LW', 'CF', 'RW']
     }
-    
-    # Calculate performance scores for each player
+
+    # Precompute min/max for each stat across all players
+    stat_minmax = {}
+    for cat, weights in WEIGHTS.items():
+        for stat in weights:
+            values = []
+            for p in player_stats:
+                try:
+                    v = float(p.get(stat, 0))
+                    values.append(v)
+                except Exception:
+                    continue
+            if values:
+                stat_minmax[stat] = (min(values), max(values))
+            else:
+                stat_minmax[stat] = (0, 0)
+
+    def normalize(value, stat):
+        min_val, max_val = stat_minmax.get(stat, (0, 0))
+        if max_val == min_val:
+            return 1.0 if value > 0 else 0.0
+        return (value - min_val) / (max_val - min_val)
+
     player_scores = []
     for player in player_stats:
-        # Determine position category
-        pos_category = next((cat for cat, positions in position_categories.items() 
-                           if player['Position'] in positions), None)
+        pos = player.get('Position')
+        pos_category = next((cat for cat, positions in position_categories.items() if pos in positions), None)
         if not pos_category:
             continue
-            
-        # Get weights for this position
         weights = WEIGHTS[pos_category]
-        
-        # Calculate normalized scores for each stat
         score = 0
         stats_display = []
-        
         for stat, weight in weights.items():
             try:
                 value = float(player.get(stat, 0))
-                # Get min/max for this stat across all players
-                all_values = [float(p.get(stat, 0)) for p in player_stats]
-                min_val = min(all_values)
-                max_val = max(all_values)
-                
-                # Normalize and weight the stat
-                norm_value = normalize_value(value, min_val, max_val)
-                stat_score = norm_value * weight
-                score += stat_score
-                
-                # Add to display if stat is significant
-                if value > 0:
+                norm = normalize(value, stat)
+                # For negative weights (e.g., goalsConceded), invert normalization
+                if weight < 0:
+                    norm = 1 - norm
+                score += abs(weight) * norm * (1 if weight > 0 else -1)
+                if value > 0 and stat not in ['goalsConceded']:
                     stats_display.append(f"{stat}: {int(value)}")
-            except (ValueError, TypeError):
+            except Exception:
                 continue
-        
         player_scores.append({
             'name': player['Name'],
-            'position': player['Position'],
+            'position': pos,
             'score': score,
             'stats': stats_display
         })
-    
+
     if not player_scores:
         return "No valid players found"
+
     
     # Sort by score and get MVP
     player_scores.sort(key=lambda x: x['score'], reverse=True)
     mvp = player_scores[0]
     
     # Format MVP display with their key stats
-    stats_str = " | ".join(mvp['stats'])
     return f"`{mvp['name']}` (**{mvp['position']}**) : `{mvp['score'] * 100:.2f} / 100`"
+
 
 def get_best_defender(player_stats):
     """Get the best defender based on interceptions and slide tackles."""
