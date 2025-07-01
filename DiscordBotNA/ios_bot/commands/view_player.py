@@ -28,7 +28,7 @@ class PlayerStatsView(discord.ui.View):
         self.current_page = 0
         
     def create_club_stats_embed(self):
-        """Create the detailed club team stats embed (Page 1)"""
+        """Create the detailed club team stats embed (Page 2)"""
         is_captain = self.club_team_info and self.club_team_info.get('captain_id') == self.user.id
         color = discord.Color.gold() if is_captain else discord.Color.blue()
         
@@ -121,11 +121,11 @@ class PlayerStatsView(discord.ui.View):
         else:
             embed.add_field(name="**Stats**", value="No competitive stats found for this team.", inline=False)
             
-        embed.set_footer(text="Page 1/3 - Club Team Stats • Use buttons to navigate")
+        embed.set_footer(text="Page 2/3 - Club Team Stats • Use buttons to navigate")
         return embed
     
     def create_all_time_stats_embed(self):
-        """Create the all-time stats embed (Page 2)"""
+        """Create the all-time stats embed (Page 1)"""
         is_captain_of_any_team = any(team.get('captain_id') == self.user.id for team in [self.club_team_info, self.national_team_info] if team)
         color = discord.Color.gold() if is_captain_of_any_team else discord.Color.blue()
         
@@ -208,7 +208,7 @@ class PlayerStatsView(discord.ui.View):
         else:
             embed.add_field(name="**Stats**", value="No competitive stats found.", inline=False)
             
-        embed.set_footer(text="Page 2/3 - All-Time Stats • Use buttons to navigate")
+        embed.set_footer(text="Page 1/3 - All-Time Stats • Use buttons to navigate")
         return embed
         
     def create_weekly_breakdown_embed(self):
@@ -257,9 +257,9 @@ class PlayerStatsView(discord.ui.View):
         
         # Get the appropriate embed
         if self.current_page == 0:
-            embed = self.create_club_stats_embed()
-        elif self.current_page == 1:
             embed = self.create_all_time_stats_embed()
+        elif self.current_page == 1:
+            embed = self.create_club_stats_embed()
         else:  # self.current_page == 2
             embed = self.create_weekly_breakdown_embed()
             

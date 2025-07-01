@@ -1,6 +1,7 @@
 from itertools import zip_longest
 from ios_bot.config import *
 from ios_bot.database_manager import get_player_by_steam_id, get_team_by_name
+import numpy as np
 
 MATCH_SUMMARIES_PATH = os.path.join(os.path.dirname(__file__), '..', 'ratings', 'match_summaries.csv')
 PLAYER_STATS_PATH = os.path.join(os.path.dirname(__file__), '..', 'ratings', 'player_stats.csv')
@@ -39,49 +40,85 @@ def normalize_value(value, min_val, max_val):
 
 def get_mvp(player_stats):
     """
-    Calculate MVP using a more realistic, position-aware, impact-based scoring system.
+    Calculate MVP using a realistic, football-based scoring system.
+    Base score starts at 5.5/10, with bonuses and penalties applied.
+    10/10 ratings are extremely rare and reserved for legendary performances.
     """
     if not player_stats:
         return "No data available"
 
-    # Define stat weights for each position
-    WEIGHTS = {
+    # Position-specific impact weights (more conservative values)
+    POSITION_WEIGHTS = {
         'GK': {
-            'keeperSaves': 0.25,
-            'keeperSavesCaught': 0.10,
-            'cleanSheets': 0.25,
-            'passesCompleted': 0.10,
-            'assists': 0.10,
-            'secondAssists': 0.05,
-            'goalsConceded': -0.40,  # negative weight
+            # Positive contributions (reduced values)
+            'keeperSaves': 0.08,           # Each save worth 0.08 points (reduced from 0.15)
+            'keeperSavesCaught': 0.06,     # Caught saves worth slightly less
+            'passesCompleted': 0.004,      # Building from back
+            'assists': 0.30,               # Rare from GK, valuable but reduced
+            'secondAssists': 0.15,         # Good distribution
+            'keyPasses': 0.10,             # Quality distribution
+            
+            # Negative contributions (penalties)
+            'goalsConceded': -0.30,        # Each goal conceded hurts more
+            'ownGoals': -0.80,             # Own goals very costly
+            'redCards': -1.50,             # Red card major penalty
+            'yellowCards': -0.25,          # Yellow card minor penalty
+            'fouls': -0.12,                # Fouls hurt GK rating
         },
         'DEF': {  # LB, CB, RB
-            'interceptions': 0.25,
-            'slidingTacklesCompleted': 0.25,
-            'passesCompleted': 0.15,
-            'assists': 0.15,
-            'secondAssists': 0.10,
-            'goals': 0.15,  # rare, so more valuable
-            'keyPasses': 0.05
+            # Positive contributions (reduced values)
+            'interceptions': 0.12,         # Key defensive stat
+            'slidingTacklesCompleted': 0.15, # Successful tackles important
+            'goals': 0.45,                 # Goals from defenders valuable but reduced
+            'assists': 0.25,               # Set pieces, crosses
+            'secondAssists': 0.12,         # Good buildup play
+            'keyPasses': 0.10,             # Quality passing
+            'passesCompleted': 0.006,      # Building from defense
+            'keeperSaves': 0.10,           # If they had to go in goal
+            
+            # Negative contributions
+            'goalsConceded': -0.20,        # Shared responsibility
+            'ownGoals': -1.00,             # Very costly mistake
+            'fouls': -0.18,                # Defensive fouls
+            'yellowCards': -0.30,          # Cards hurt defenders more
+            'redCards': -2.00,             # Red card devastating for defense
         },
         'MID': {  # CM
-            'passesCompleted': 0.25,
-            'keyPasses': 0.30,
-            'assists': 0.25,
-            'goals': 0.25,
-            'secondAssists': 0.15,
-            'interceptions': 0.15,
-            'slidingTacklesCompleted': 0.10,
-            'shotsOnGoal': 0.05,
+            # Positive contributions (reduced values)
+            'assists': 0.35,               # Primary job of midfielders
+            'secondAssists': 0.20,         # Key passes leading to assists
+            'keyPasses': 0.12,             # Creating chances
+            'goals': 0.40,                 # Goals from midfield valuable
+            'passesCompleted': 0.008,      # Midfield engine
+            'interceptions': 0.15,         # Winning ball back
+            'slidingTacklesCompleted': 0.12, # Defensive contribution
+            'shotsOnGoal': 0.10,           # Threat from distance
+            'chancesCreated': 0.15,        # Creating opportunities
+            
+            # Negative contributions
+            'fouls': -0.18,                # Disrupting play
+            'yellowCards': -0.25,          # Discipline issues
+            'redCards': -1.80,             # Losing midfield control
+            'ownGoals': -0.90,             # Rare but costly
         },
         'FWD': {  # LW, CF, RW
-            'goals': 0.35,
-            'assists': 0.25,
-            'shotsOnGoal': 0.10,
-            'keyPasses': 0.15,
-            'secondAssists': 0.15,
-            'passesCompleted': 0.05,
-            'interceptions': 0.05,
+            # Positive contributions (reduced values)
+            'goals': 0.40,                 # Primary job of forwards
+            'assists': 0.30,               # Creating for teammates
+            'shotsOnGoal': 0.08,           # Testing keeper
+            'keyPasses': 0.12,             # Final ball
+            'secondAssists': 0.15,         # Buildup play
+            'chancesCreated': 0.20,        # Creating opportunities
+            'foulsSuffered': 0.05,         # Drawing fouls
+            'passesCompleted': 0.005,      # Link-up play
+            'interceptions': 0.08,         # Pressing from front
+            
+            # Negative contributions
+            'fouls': -0.15,                # Unnecessary fouls
+            'yellowCards': -0.30,          # Discipline
+            'redCards': -1.70,             # Losing attacking threat
+            'ownGoals': -0.95,             # Rare but devastating
+            'offsides': -0.08,             # Poor positioning
         }
     }
 
@@ -93,66 +130,110 @@ def get_mvp(player_stats):
         'FWD': ['LW', 'CF', 'RW']
     }
 
-    # Precompute min/max for each stat across all players
-    stat_minmax = {}
-    for cat, weights in WEIGHTS.items():
-        for stat in weights:
-            values = []
-            for p in player_stats:
-                try:
-                    v = float(p.get(stat, 0))
-                    values.append(v)
-                except Exception:
-                    continue
-            if values:
-                stat_minmax[stat] = (min(values), max(values))
-            else:
-                stat_minmax[stat] = (0, 0)
-
-    def normalize(value, stat):
-        min_val, max_val = stat_minmax.get(stat, (0, 0))
-        if max_val == min_val:
-            return 1.0 if value > 0 else 0.0
-        return (value - min_val) / (max_val - min_val)
-
     player_scores = []
+    
     for player in player_stats:
-        pos = player.get('Position')
+        pos = player.get('Position', '').upper()
         pos_category = next((cat for cat, positions in position_categories.items() if pos in positions), None)
+        
         if not pos_category:
             continue
-        weights = WEIGHTS[pos_category]
-        score = 0
-        stats_display = []
+            
+        weights = POSITION_WEIGHTS[pos_category]
+        
+        # Start with lower base rating of 5.5/10 (slightly below average performance)
+        base_score = 5.5
+        bonus_score = 0.0
+        
+        # Track significant contributions for display
+        key_stats = []
+        
+        # Calculate bonuses and penalties
         for stat, weight in weights.items():
             try:
                 value = float(player.get(stat, 0))
-                norm = normalize(value, stat)
-                # For negative weights (e.g., goalsConceded), invert normalization
-                if weight < 0:
-                    norm = 1 - norm
-                score += abs(weight) * norm * (1 if weight > 0 else -1)
-                if value > 0 and stat not in ['goalsConceded']:
-                    stats_display.append(f"{stat}: {int(value)}")
-            except Exception:
+                if value > 0:
+                    contribution = value * weight
+                    bonus_score += contribution
+                    
+                    # Track significant positive contributions (higher threshold)
+                    if weight > 0 and value > 0 and contribution > 0.25:
+                        key_stats.append(f"{stat}: {int(value)}")
+                        
+            except (ValueError, TypeError):
                 continue
+        
+        # Calculate final score (base + bonus, with floor and ceiling)
+        final_score = base_score + bonus_score
+        
+        # Apply realistic bounds (3.0 to 10.0 scale)
+        final_score = max(3.0, min(10.0, final_score))
+        
+        # Special bonuses for exceptional performances (reduced bonuses)
+        try:
+            goals = float(player.get('goals', 0))
+            assists = float(player.get('assists', 0))
+            saves = float(player.get('keeperSaves', 0)) + float(player.get('keeperSavesCaught', 0))
+            
+            # Hat-trick bonus (reduced)
+            if goals >= 3:
+                final_score += 0.6  # Reduced from 0.8
+                key_stats.append("Hat-trick!")
+            
+            # Double-double bonus (2+ goals and 2+ assists) (reduced)
+            elif goals >= 2 and assists >= 2:
+                final_score += 0.4  # Reduced from 0.6
+                key_stats.append("Goals+Assists")
+            
+            # Exceptional GK performance (8+ saves with 0-1 goals conceded) (reduced)
+            if pos_category == 'GK' and saves >= 8:
+                goals_conceded = float(player.get('goalsConceded', 0))
+                if goals_conceded <= 3:
+                    final_score += 0.6  # Reduced from 0.7
+                    key_stats.append("Outstanding saves")
+                else:
+                    final_score += 0.3  # Reduced from 0.3
+                    key_stats.append("Good saves")
+            
+            # Clean sheet bonus for defenders and GKs (reduced)
+            if pos_category in ['GK', 'DEF']:
+                goals_conceded = float(player.get('goalsConceded', 0))
+                if goals_conceded == 0:
+                    final_score += 0.3  # Reduced from 0.4
+                    key_stats.append("Clean sheet")
+                    
+        except (ValueError, TypeError):
+            pass
+        
+        # Apply diminishing returns for high scores (makes 9+ much harder to achieve)
+        if final_score > 8.5:
+            # Exponential difficulty curve for scores above 8.0
+            excess = final_score - 8.5
+            # Apply severe diminishing returns: score above 8 becomes progressively harder
+            diminished_excess = excess * (0.3 + 0.1 * np.exp(-excess * 2))
+            final_score = 8.5 + diminished_excess
+        
+        # Ensure final score stays within bounds after all calculations
+        final_score = max(3.0, min(10.0, final_score))
+        
         player_scores.append({
             'name': player['Name'],
             'position': pos,
-            'score': score,
-            'stats': stats_display
+            'score': final_score,
+            'stats': key_stats[:3]  # Show top 3 key stats
         })
 
     if not player_scores:
         return "No valid players found"
 
-    
     # Sort by score and get MVP
     player_scores.sort(key=lambda x: x['score'], reverse=True)
     mvp = player_scores[0]
     
-    # Format MVP display with their key stats
-    return f"`{mvp['name']}` (**{mvp['position']}**) : `{mvp['score'] * 100:.2f} / 100`"
+    # Enhanced MVP display with key contributions and more precise rating descriptions
+    stats_display = " | ".join(mvp['stats']) if mvp['stats'] else "Solid performance"
+    
+    return f"`{mvp['name']}` (**{mvp['position']}**) : `{mvp['score']:.1f}/10` - {stats_display}"
 
 
 def get_best_defender(player_stats):
@@ -218,7 +299,7 @@ def format_team_lineup(team_name, lineup_data, position_order, player_stats=None
             if player['Team Name'] == team_name:
                 steam_id_to_stats[player['Steam ID']] = player
     
-    # Create a set of players who were subbed out (for the 🔄 symbol)
+    # Create a set of players who were subbed out (for the :Substitute: symbol)
     subbed_out_players = set()
     if substitution_summary and home_team_name and away_team_name:
         for sub in substitution_summary:
@@ -241,19 +322,27 @@ def format_team_lineup(team_name, lineup_data, position_order, player_stats=None
                     stats.append(f"👟x{int(float(player['assists']))}")
                 if int(float(player.get('keeperSaves', 0))) > 0:
                     stats.append(f"🧤x{int(float(player['keeperSaves']))}")
+                
+                # Add card emojis (red overrides yellow, no counts)
+                red_cards = int(float(player.get('redCards', 0)))
+                yellow_cards = int(float(player.get('yellowCards', 0)))
+                if red_cards > 0:
+                    stats.append("🟥")
+                elif yellow_cards > 0:
+                    stats.append("🟨")
             
             stats_str = " ".join(stats)
             
-            # Add 🔄 symbol if player was subbed out
+            # Add <:Substitute:1388489365612662887> symbol if player was subbed out
             sub_symbol = " 🔄" if steamid in subbed_out_players else ""
             
-            lines.append(f"{pos} {name}{sub_symbol} {stats_str}")
+            lines.append(f"{pos}: {name}{sub_symbol} {stats_str}")
         else:
             # Add red X for missing GK in single keeper games
-            if pos == 'GK' and len(position_order) == 6:  # 6v6 game
-                lines.append(f"{pos} ❌")
+            if pos == 'GK' and len(position_order) == 8:
+                lines.append(f"{pos}: ❌")
             else:
-                lines.append(f"{pos} -")
+                lines.append(f"{pos}: -")
     return "\n".join(lines)
 
 def format_substitutions(substitution_summary, player_stats):
@@ -283,6 +372,14 @@ def format_substitutions(substitution_summary, player_stats):
         if int(float(left_stats.get('keeperSaves', 0))) > 0:
             left_stats_str.append(f"🧤x{int(float(left_stats['keeperSaves']))}")
         
+        # Add card emojis for left player (red overrides yellow, no counts)
+        left_red_cards = int(float(left_stats.get('redCards', 0)))
+        left_yellow_cards = int(float(left_stats.get('yellowCards', 0)))
+        if left_red_cards > 0:
+            left_stats_str.append("🟥")
+        elif left_yellow_cards > 0:
+            left_stats_str.append("🟨")
+        
         # Format stats for joining player
         join_stats_str = []
         if int(float(join_stats.get('goals', 0))) > 0:
@@ -291,6 +388,14 @@ def format_substitutions(substitution_summary, player_stats):
             join_stats_str.append(f"👟x{int(float(join_stats['assists']))}")
         if int(float(join_stats.get('keeperSaves', 0))) > 0:
             join_stats_str.append(f"🧤x{int(float(join_stats['keeperSaves']))}")
+        
+        # Add card emojis for joining player (red overrides yellow, no counts)
+        join_red_cards = int(float(join_stats.get('redCards', 0)))
+        join_yellow_cards = int(float(join_stats.get('yellowCards', 0)))
+        if join_red_cards > 0:
+            join_stats_str.append("🟥")
+        elif join_yellow_cards > 0:
+            join_stats_str.append("🟨")
         
         left_stats_display = " ".join(left_stats_str) if left_stats_str else ""
         join_stats_display = " ".join(join_stats_str) if join_stats_str else ""

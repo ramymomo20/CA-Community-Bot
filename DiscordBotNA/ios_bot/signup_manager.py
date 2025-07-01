@@ -463,9 +463,9 @@ async def format_lineup(team_state: dict, channel_id: int, guild_id: int = None)
     
     lineup_parts = []
     # Assuming team_state is a dict of {position: player_data}
-    for pos, player_data in sorted(team_state.items()):
+    for pos, player_data in team_state.items():
         player = player_data['player'] if player_data else None
-        player_display = "" # Default to empty string
+        player_display = "❔" # Default to empty string
         if player:
             player_display = player.display_name # Works for both Member and TextPlayer
 
