@@ -6,6 +6,7 @@ import requests
 import io
 import tempfile
 import csv
+import os
 
 class PlayerStatsView(discord.ui.View):
     def __init__(self, user, club_team_info, national_team_info, club_team_position, club_team_stats, club_team_appearances, national_team_position, national_team_stats, national_team_appearances, all_time_pos, all_time_stats, total_appearances, card_path, player_rating):
@@ -104,7 +105,7 @@ class PlayerStatsView(discord.ui.View):
                 f"**Saves:** `{int(float(self.club_team_stats.get('keeperSaves')))}`",
                 f"**Saves Caught:** `{int(float(self.club_team_stats.get('keeperSavesCaught')))}`",
                 f"**Goals Conceded:** `{int(float(self.club_team_stats.get('goalsConceded')))}`",
-                f"**Save Rate:** `{(int(float(self.club_team_stats.get('keeperSaves'))) / int(float(self.club_team_stats.get('goalsConceded')))):.2%}`"
+                f"**Save Rate:** `{(int(float(self.club_team_stats.get('keeperSaves'))) / (int(float(self.club_team_stats.get('goalsConceded'))) + int(float(self.club_team_stats.get('keeperSaves'))))):.2%}`"
             ]
             embed.add_field(name="🥅 **Goalkeeper**", value="\n".join(goalkeeper_stats), inline=True)
             
@@ -191,7 +192,7 @@ class PlayerStatsView(discord.ui.View):
                 f"**Saves:** `{int(float(self.all_time_stats.get('keeperSaves', 0)))}`",
                 f"**Saves Caught:** `{int(float(self.all_time_stats.get('keeperSavesCaught', 0)))}`",
                 f"**Goals Conceded:** `{int(float(self.all_time_stats.get('goalsConceded', 1)))}`",
-                f"**Save Rate:** `{int(float(self.all_time_stats.get('keeperSaves', 0))) / int(float(self.all_time_stats.get('goalsConceded', 0))):.2%}`"
+                f"**Save Rate:** `{(int(float(self.all_time_stats.get('keeperSaves', 0))) / (int(float(self.all_time_stats.get('goalsConceded', 0))) + int(float(self.all_time_stats.get('keeperSaves', 0))))):.2%}`"
             ]
             embed.add_field(name="🥅 **Goalkeeper**", value="\n".join(goalkeeper_stats), inline=True)
             
@@ -371,7 +372,7 @@ def calculate_all_time_stats(player_stats_rows):
                 continue # Skip if value is not a valid number
         
         position = row.get('Position')
-        if position:
+        if position and str(position).lower() not in ['nan', 'n/a', 'null', 'none', '']:
             position_counter[position] += 1
 
     # Determine the most common position
@@ -417,7 +418,7 @@ def calculate_team_specific_stats(player_stats_rows, team_name):
                 continue # Skip if value is not a valid number
         
         position = row.get('Position')
-        if position:
+        if position and str(position).lower() not in ['nan', 'n/a', 'null', 'none', '']:
             position_counter[position] += 1
 
     # Determine the most common position for this team
@@ -494,22 +495,24 @@ async def download_image(url, size=(100, 100)):
 async def generate_player_card(user, club_team_info, national_team_info, team_position, team_stats, team_appearances, player_rating=None):
     """Generate a player card image with dynamic data."""
     try:
-        # Load the template image        
+        # Load the template image and determine rating display
         
         # Use actual player rating from final_ratings.csv if available
         if player_rating is not None:
-            # Convert from ~5-10 scale to display scale for the card (50-99)
-            # Scale the rating: 5.0 -> 50, 10.0 -> 99
-            rating = f"{player_rating * 10:.1f}"
-            test_rating = int(rating)
-            if test_rating >= 50 and test_rating < 60:
-                CARD_TEMPLATE_PATH = BRONZE_TEMPLATE_PATH
-            elif test_rating >= 60 and test_rating < 70:
-                CARD_TEMPLATE_PATH = SILVER_TEMPLATE_PATH
-            elif test_rating >= 70 and test_rating < 80:
+            # Convert from rating scale to display scale for the card
+            # Scale the rating: multiply by 10 for display (5.0 -> 50, 10.0 -> 100)
+            display_rating = player_rating * 10
+            rating = f"{display_rating:.1f}"
+            
+            # Choose template based on rating - cover all possible values
+            if display_rating >= 80:
                 CARD_TEMPLATE_PATH = GOLD_TEMPLATE_PATH
+            elif display_rating >= 60:
+                CARD_TEMPLATE_PATH = SILVER_TEMPLATE_PATH
+            else:
+                CARD_TEMPLATE_PATH = BRONZE_TEMPLATE_PATH
         else:
-            rating = 0  # Default rating if no data available
+            rating = "0"  # Default rating if no data available
             CARD_TEMPLATE_PATH = BRONZE_TEMPLATE_PATH
             
         if not os.path.exists(CARD_TEMPLATE_PATH):

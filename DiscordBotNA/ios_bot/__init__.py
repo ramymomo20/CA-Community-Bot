@@ -44,30 +44,60 @@ async def on_connect():
     # Sync commands with optimal parameters for development
     # Consider using TEST_GUILD_ID for quicker syncs during dev if commands are guild-specific
     # For global commands, syncing without guild_ids is standard but can take time to propagate.
-    await bot.sync_commands(
-        force=True,  # Always sync to ensure latest changes
-        register_guild_commands=True, # Ensure guild commands are registered if you use them
-        delete_existing=True  # Remove old/stale commands
-    )
-    print(f"🔄 Commands synced.") # General message, adjust if using TEST_GUILD_ID
+    try:
+        await bot.sync_commands(
+            force=True,  # Always sync to ensure latest changes
+            register_guild_commands=True, # Ensure guild commands are registered if you use them
+            delete_existing=True  # Remove old/stale commands
+        )
+        print(f"🔄 Commands synced.") # General message, adjust if using TEST_GUILD_ID
+    except Exception as e:
+        print(f"Error syncing commands: {e}")
+
 
 @bot.event
 async def on_ready():
-    print("================ Successful login")
-    # Initialize the database (create tables if they don't exist)
-    await initialize_database()
+    try:
+        print("================ Successful login")
+        # Initialize the database (create tables if they don't exist)
+        await initialize_database()
 
-    await bot.change_presence(
-        status=discord.Status.online, 
-        activity=discord.Activity(
-            type=discord.ActivityType.watching, 
-            name="Your Performances..."
+        await bot.change_presence(
+            status=discord.Status.online, 
+            activity=discord.Activity(
+                type=discord.ActivityType.watching, 
+                name="Your Performances..."
+            )
         )
-    )
-    # Discover matchmaking channels and update config lists directly
-    await discover_matchmaking_channels()
-    # Start all scheduled tasks
-    setup_tasks()
-    print("================ Bot fully initialized")
+        # Discover matchmaking channels and update config lists directly
+        await discover_matchmaking_channels()
+        # Start all scheduled tasks
+        setup_tasks()
+        print("================ Bot fully initialized")
+    except Exception as e:
+        print(f"Error during bot initialization: {e}")
+        
+@bot.event
+async def on_error(event, *args, **kwargs):
+    """Handle errors to prevent bot crashes"""
+    import traceback
+    print(f"Error in event {event}: {traceback.format_exc()}")
 
-bot.run(token)
+def main():
+    """Main function to start the bot"""
+    print("Starting IOSCA Community Bot...")
+    try:
+        bot.run(token)
+    except discord.errors.LoginFailure:
+        print("ERROR: Invalid bot token. Please check your DISCORD_BOT_TOKEN environment variable.")
+        raise
+    except discord.errors.ConnectionClosed as e:
+        print(f"Discord connection closed: {e}")
+        raise
+    except Exception as e:
+        print(f"Critical error running bot: {e}")
+        raise
+
+# Only run if this file is executed directly
+if __name__ == "__main__":
+    main()

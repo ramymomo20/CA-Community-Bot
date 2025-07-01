@@ -16,7 +16,7 @@ from ios_bot.signup_manager import (
 from ios_bot.commands.utils import delete_after_delay, move_sub_to_position # Added move_sub_to_position import
 from ios_bot.challenge_manager import active_challenges
 from ios_bot.announcements import announce_match_ready # Added import
-from ios_bot.database_manager import add_active_match, get_team_by_name
+from ios_bot.database_manager import add_active_match, get_team_by_name, get_all_servers, get_server_by_name
 
 import time as clock
 
@@ -298,7 +298,7 @@ class MapSelect(View):
         selected_map = interaction.data["values"][0]
         
         # Find the correct RCON password for the selected server
-        server_details = next((s for s in RCON_SERVERS if s.get('name') == self.region_key), None)
+        server_details = await get_server_by_name(self.region_key)
 
         if not server_details:
             await interaction.followup.send(f"❌ Critical Error: Could not find the details for server '{self.region_key}'. Please try again.", ephemeral=True)
@@ -451,23 +451,30 @@ class RegionSelect(View):
         view = cls(fmt, mentions, guild_name, requester, guild, subs, opponent_guild_name, challenge_data)
         
         options = []
-        tasks = [get_server_status(s['address'], s['password']) for s in RCON_SERVERS]
-        results = await asyncio.gather(*tasks)
+        
+        # Get servers from database instead of hardcoded list
+        rcon_servers = await get_all_servers()
 
-        for i, s_config in enumerate(RCON_SERVERS):
-            status = results[i]
-            
-            if not status.get("offline") and status['players'] <= 8:
-                label = f"{s_config['name']} ({status['players']}/{status['max_players']})"
-                description = "Ready to host a match."
-                options.append(SelectOption(
-                    label=label,
-                    value=s_config['name'],
-                    description=description
-                ))
-
-        if not options:
+        if not rcon_servers:
             options.append(SelectOption(label="No servers available", value="no_servers_available", disabled=True))
+        else:
+            tasks = [get_server_status(s['address'], s['password']) for s in rcon_servers]
+            results = await asyncio.gather(*tasks)
+
+            for i, s_config in enumerate(rcon_servers):
+                status = results[i]
+                
+                if not status.get("offline") and status['players'] <= 8:
+                    label = f"{s_config['name']} ({status['players']}/{status['max_players']})"
+                    description = "Ready to host a match."
+                    options.append(SelectOption(
+                        label=label,
+                        value=s_config['name'],
+                        description=description
+                    ))
+
+            if not options:
+                options.append(SelectOption(label="No servers available", value="no_servers_available", disabled=True))
 
         sel = Select(
             placeholder="Select a game server region…",
@@ -487,7 +494,8 @@ class RegionSelect(View):
              await interaction.followup.send("There are no game servers configured.", ephemeral=True)
              return
         
-        server_details = next((s for s in RCON_SERVERS if s.get('name') == selected_region_key), None)
+        # Get server details from database instead of hardcoded list
+        server_details = await get_server_by_name(selected_region_key)
         if not server_details:
             await interaction.followup.send(f"❌ Error: Could not find details for server '{selected_region_key}'.", ephemeral=True)
             return

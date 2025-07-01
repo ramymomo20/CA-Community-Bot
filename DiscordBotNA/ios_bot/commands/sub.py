@@ -25,7 +25,7 @@ async def sub(ctx: ApplicationContext):
     if is_player_signed(state, player):
         signed_team_num, signed_pos = get_player_position(state, player)
         team_name_desc = f"Team {signed_team_num}"
-        if state.get("context_type") in ["team_6s", "team_8s"] and signed_team_num == 1:
+        if state.get("context_type") in ["team_8s"] and signed_team_num == 1:
             team_name_desc = state.get("team_name", "your team")
         await ctx.respond(f"⚠️ You are already signed for **{signed_pos}** on {team_name_desc}. Unsign first if you want to be a sub.", ephemeral=True)
         return

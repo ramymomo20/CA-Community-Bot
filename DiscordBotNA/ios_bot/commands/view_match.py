@@ -207,21 +207,47 @@ def get_best_goalkeeper(player_stats):
 
     return best_gk
 
-def format_team_lineup(team_name, players, position_order):
-    """Formats a single team's lineup with stats."""
+def format_team_lineup(team_name, lineup_data, position_order, player_stats=None, substitution_summary=None, home_team_name=None, away_team_name=None):
+    """Formats a single team's lineup with stats using the new lineup data structure."""
     lines = []
-    for pos in position_order:
-        if pos in players:
-            p = players[pos]
+    
+    # Create a mapping of steam_id to player stats for easy lookup
+    steam_id_to_stats = {}
+    if player_stats:
+        for player in player_stats:
+            if player['Team Name'] == team_name:
+                steam_id_to_stats[player['Steam ID']] = player
+    
+    # Create a set of players who were subbed out (for the 🔄 symbol)
+    subbed_out_players = set()
+    if substitution_summary and home_team_name and away_team_name:
+        for sub in substitution_summary:
+            team_side, (left_name, left_steamid), (join_name, join_steamid) = sub
+            # Map team_side to actual team name for comparison
+            if team_side == "home" and team_name == home_team_name:
+                subbed_out_players.add(left_steamid)
+            elif team_side == "away" and team_name == away_team_name:
+                subbed_out_players.add(left_steamid)
+    
+    for pos, name, steamid in lineup_data:
+        if name and steamid:
+            # Get player stats if available
             stats = []
-            if int(float(p.get('goals', 0))) > 0:
-                stats.append(f"⚽x{int(float(p['goals']))}")
-            if int(float(p.get('assists', 0))) > 0:
-                stats.append(f"👟x{int(float(p['assists']))}")
-            if int(float(p.get('keeperSaves', 0))) > 0:
-                stats.append(f"🧤x{int(float(p['keeperSaves']))}")
+            if steamid in steam_id_to_stats:
+                player = steam_id_to_stats[steamid]
+                if int(float(player.get('goals', 0))) > 0:
+                    stats.append(f"⚽x{int(float(player['goals']))}")
+                if int(float(player.get('assists', 0))) > 0:
+                    stats.append(f"👟x{int(float(player['assists']))}")
+                if int(float(player.get('keeperSaves', 0))) > 0:
+                    stats.append(f"🧤x{int(float(player['keeperSaves']))}")
+            
             stats_str = " ".join(stats)
-            lines.append(f"{pos} {p['Name']} {stats_str}")
+            
+            # Add 🔄 symbol if player was subbed out
+            sub_symbol = " 🔄" if steamid in subbed_out_players else ""
+            
+            lines.append(f"{pos} {name}{sub_symbol} {stats_str}")
         else:
             # Add red X for missing GK in single keeper games
             if pos == 'GK' and len(position_order) == 6:  # 6v6 game
@@ -229,6 +255,52 @@ def format_team_lineup(team_name, players, position_order):
             else:
                 lines.append(f"{pos} -")
     return "\n".join(lines)
+
+def format_substitutions(substitution_summary, player_stats):
+    """Formats the substitution summary with player stats."""
+    if not substitution_summary:
+        return "No substitutions"
+    
+    # Create a mapping of steam_id to player stats for easy lookup
+    steam_id_to_stats = {}
+    for player in player_stats:
+        steam_id_to_stats[player['Steam ID']] = player
+    
+    sub_lines = []
+    for i, sub in enumerate(substitution_summary):
+        team_side, (left_name, left_steamid), (join_name, join_steamid) = sub
+        
+        # Get stats for both players
+        left_stats = steam_id_to_stats.get(left_steamid, {})
+        join_stats = steam_id_to_stats.get(join_steamid, {})
+        
+        # Format stats for left player
+        left_stats_str = []
+        if int(float(left_stats.get('goals', 0))) > 0:
+            left_stats_str.append(f"⚽x{int(float(left_stats['goals']))}")
+        if int(float(left_stats.get('assists', 0))) > 0:
+            left_stats_str.append(f"👟x{int(float(left_stats['assists']))}")
+        if int(float(left_stats.get('keeperSaves', 0))) > 0:
+            left_stats_str.append(f"🧤x{int(float(left_stats['keeperSaves']))}")
+        
+        # Format stats for joining player
+        join_stats_str = []
+        if int(float(join_stats.get('goals', 0))) > 0:
+            join_stats_str.append(f"⚽x{int(float(join_stats['goals']))}")
+        if int(float(join_stats.get('assists', 0))) > 0:
+            join_stats_str.append(f"👟x{int(float(join_stats['assists']))}")
+        if int(float(join_stats.get('keeperSaves', 0))) > 0:
+            join_stats_str.append(f"🧤x{int(float(join_stats['keeperSaves']))}")
+        
+        left_stats_display = " ".join(left_stats_str) if left_stats_str else ""
+        join_stats_display = " ".join(join_stats_str) if join_stats_str else ""
+        
+        team_display = "Home" if team_side == "home" else "Away"
+        sub_lines.append(f"({i+1}) {team_display}: {left_name} 🔄 {join_name}")
+        if left_stats_display or join_stats_display:
+            sub_lines.append(f"    {left_name}: {left_stats_display} | {join_name}: {join_stats_display}")
+    
+    return "\n".join(sub_lines)
 
 async def get_player_mention(performer_str: str):
     """
@@ -298,6 +370,11 @@ class MatchSelect(Select):
         # Get all player stats for this specific match
         match_player_stats = get_player_stats_for_match_id(selected_match_id)
 
+        # Parse lineup data from JSON strings
+        initial_lineups = json.loads(match_data.get('initial_lineups', '{}'))
+        final_lineups = json.loads(match_data.get('final_lineups', '{}'))
+        substitution_summary = json.loads(match_data.get('substitution_summary', '[]'))
+
         # Build main match summary embed
         embed = discord.Embed(
             title=f"`{home_team_name}`  **{scoreline}**  `{away_team_name}`",
@@ -321,30 +398,35 @@ class MatchSelect(Select):
         else:
             embed.set_thumbnail(url=home_icon_url)
 
-        # Add MVP and other awards
+        # Add MVP
         mvp_name = get_mvp(match_player_stats)
         embed.add_field(name="🏆 MVP", value=mvp_name, inline=False)
         
-        # Add lineups in separate fields
-        if match_player_stats:
+        # Add lineups using the new lineup data
+        if initial_lineups and final_lineups:
             # Define position order based on game type
             position_order = ['GK', 'LB', 'RB', 'CM', 'LW', 'RW'] if game_type == '6v6' else ['GK', 'LB', 'CB', 'RB', 'CM', 'LW', 'CF', 'RW']
             
-            # Get players by position for each team
-            home_players = {p['Position']: p for p in match_player_stats if p['Team Name'] == home_team_name}
-            away_players = {p['Position']: p for p in match_player_stats if p['Team Name'] == away_team_name}
+            # Get lineup data for each team
+            home_initial = initial_lineups.get('home', [])
+            away_initial = initial_lineups.get('away', [])
             
-            # Format each team's lineup
-            home_lineup = format_team_lineup(home_team_name, home_players, position_order)
-            away_lineup = format_team_lineup(away_team_name, away_players, position_order)
+            # Format each team's initial lineup
+            home_lineup = format_team_lineup(home_team_name, home_initial, position_order, match_player_stats, substitution_summary, home_team_name, away_team_name)
+            away_lineup = format_team_lineup(away_team_name, away_initial, position_order, match_player_stats, substitution_summary, home_team_name, away_team_name)
             
             # Add lineups as separate fields
             embed.add_field(name=f"{home_team_name}'s Lineup", value=f"```{home_lineup}```", inline=True)
             embed.add_field(name=f"{away_team_name}'s Lineup", value=f"```{away_lineup}```", inline=True)
+            
+            # Add substitutions field if there were any
+            if substitution_summary:
+                subs_text = format_substitutions(substitution_summary, match_player_stats)
+                embed.add_field(name="🔄 SUBS", value=f"```{subs_text}```", inline=False)
         else:
-            embed.add_field(name="Players", value="Detailed player stats not available for this match.", inline=False)
+            embed.add_field(name="Players", value="Detailed lineup data not available for this match.", inline=False)
 
-        # add other people
+        # Add other awards
         best_defender_name = get_best_defender(match_player_stats)
         embed.add_field(name="🛡️ Best Defender", value=best_defender_name, inline=False)
 

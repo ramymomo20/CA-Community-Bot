@@ -1,5 +1,6 @@
 from ios_bot.config import *
 from ios_bot.signup_manager import get_channel_context
+from ios_bot.database_manager import get_all_servers, get_server_by_name
 
 # --- Cooldown Management ---
 request_sub_cooldowns = {}
@@ -121,7 +122,8 @@ class ServerSelectView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         selected_server_name = self.children[0].values[0]
         
-        server_details = next((s for s in RCON_SERVERS if s.get('name') == selected_server_name), None)
+        # Get server details from database instead of hardcoded list
+        server_details = await get_server_by_name(selected_server_name)
         if not server_details:
             await interaction.followup.send("❌ Error: Could not find details for the selected server.", ephemeral=True)
             return
@@ -130,7 +132,6 @@ class ServerSelectView(discord.ui.View):
         self.stop()
 
 # --- Command ---
-
 @bot.slash_command(
     name="request_sub",
     description="Request a substitute for a specific position in a server."
@@ -143,11 +144,18 @@ async def request_sub(ctx: ApplicationContext):
 
     await ctx.defer(ephemeral=True)
 
-    tasks = [get_server_status(s['address'], s['password']) for s in RCON_SERVERS]
+    # Get servers from database instead of hardcoded list
+    rcon_servers = await get_all_servers()
+    
+    if not rcon_servers:
+        await ctx.followup.send("❌ No servers found in database. Please contact an administrator.", ephemeral=True)
+        return
+
+    tasks = [get_server_status(s['address'], s['password']) for s in rcon_servers]
     results = await asyncio.gather(*tasks)
 
     options = []
-    for i, s_config in enumerate(RCON_SERVERS):
+    for i, s_config in enumerate(rcon_servers):
         status = results[i]
         if not status.get("offline"):
             label = f"{s_config['name']} ({status['players']}/{status['max_players']})"

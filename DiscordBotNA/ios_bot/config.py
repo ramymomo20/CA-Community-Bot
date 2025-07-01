@@ -11,6 +11,27 @@ import mysql.connector
 from mysql.connector import Error
 from googletrans import Translator
 
+# Load environment variables from .env file if it exists
+def load_env_file():
+    """Load environment variables from .env file if it exists"""
+    env_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
+    if os.path.exists(env_file):
+        print(f"Loading environment variables from {env_file}")
+        with open(env_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    # Remove quotes if present
+                    value = value.strip('"\'')
+                    os.environ[key] = value
+        print("Environment variables loaded from .env file")
+    else:
+        print("No .env file found, using system environment variables")
+
+# Load .env file before accessing environment variables
+load_env_file()
+
 # Bot setup with required permissions
 intents = discord.Intents.default()
 intents.message_content = True
@@ -20,11 +41,10 @@ intents.guilds = True  # Required for guild join events
 bot = discord.Bot(intents=intents)
 
 # Bot configuration
-BOT_ID = ""  # Replace this with your bot's client ID
-# BOT_ADMIN_IDS = [] # Add your Discord User ID here, e.g., [123456789012345678] # Commented out as per new requirement
-MAIN_GUILD_ID = 6 # Your main Discord server ID
-ADMIN_ROLE_ID = 1 # Role ID in MAIN_GUILD_ID that grants admin delete privileges for teams
-MY_PERM = 1
+BOT_ID = os.getenv('CLIENT_ID')  # Replace this with your bot's client ID
+MAIN_GUILD_ID = 1119055568410251366 # Your main Discord server ID
+ADMIN_ROLE_ID = 1358524106961588495 # Role ID in MAIN_GUILD_ID that grants admin delete privileges for teams
+MY_PERM = 1376625320622297100
 
 # Required permissions for the bot
 REQUIRED_PERMISSIONS = discord.Permissions(
@@ -47,16 +67,18 @@ def get_invite_link():
 
 
 link = 'https://docs.google.com/spreadsheets/d/1DInBbtsCXE3kBJR2CtLSmdDsE9EP7n1nvI0GqYJ2exY/edit?usp=sharing'
-token = ''
+token = os.getenv('DISCORD_BOT_TOKEN')
+if not token:
+    raise ValueError("DISCORD_BOT_TOKEN environment variable is required but not set")
 
 # Database Info
-host=""
-port=3306
-user=""
-password=""
-database=""
-charset='utf8mb4'
-collation='utf8mb4_general_ci'
+host = os.getenv('DB_HOST', 'db-par-01.apollopanel.com')
+port = int(os.getenv('DB_PORT', '3306'))
+user = os.getenv('DB_USER')
+password = os.getenv('DB_PASSWORD')  
+database = os.getenv('DB_NAME')
+charset = 'utf8mb4'
+collation = 'utf8mb4_general_ci'
 
 # Constants
 SIXES_MAIN_MATCHMAKING_CHANNELS = []
@@ -97,17 +119,8 @@ INVALID_PERMISSIONS = "You do not have the permission to do that."
 NON_EXISTENT = "That account is invalid."
 
 # --- Guild & Channel IDs ---
-GUILD_ID = 1 # Main Guild ID (IOSoccer Central America)
-MAIN_GUILD_ID = 1 # Explicitly named for clarity
-
-# --- RCON Server Configuration ---
-# This list can be dynamically appended to by the /edit_main_server command.
-# Changes made by the command are for the current session only and will be lost on restart.
-RCON_SERVERS = [
-    {"name": "Florida", "address": "199.127.63", "password": ""},
-    {"name": "Georgia", "address": "199.127.62", "password": ""},
-    {"name": "Snowy's Georgia", "address": "199.127.62", "password": ""}
-]
+GUILD_ID = 1119055568410251366 # Main Guild ID (IOSoccer Central America)
+MAIN_GUILD_ID = 1119055568410251366 # Explicitly named for clarity
 
 # Main Matchmaking Channels
 EIGHTS_CHANNEL_REGEX_PATTERN = r"8v8"
@@ -115,7 +128,6 @@ SIXES_CHANNEL_REGEX_PATTERN = r"6v6"
 
 # Channel for announcing started Team vs Team or Team vs Main Guild challenges
 # also to announce when teams are created, deleted, or when bot is invited.
-MAIN_CHALLENGE_ANNOUNCEMENT_CHANNEL_ID = 1
-OTHER_CHALLENGE_ANNOUNCEMENT_CHANNEL_ID = 1
-
-FIXTURES_CHANNEL_ID = 1
+MAIN_CHALLENGE_ANNOUNCEMENT_CHANNEL_ID = 1119057083988451371
+OTHER_CHALLENGE_ANNOUNCEMENT_CHANNEL_ID = 1119057083988451371
+FIXTURES_CHANNEL_ID = 1382748436285096059

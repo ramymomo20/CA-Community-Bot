@@ -1,11 +1,12 @@
 import json
 import csv
-from collections import Counter
+from collections import Counter, defaultdict, deque
 import paramiko
 import re
 from datetime import datetime
 import os
 import sys
+import asyncio
 
 # --- Path fix ---
 # Add the project root to the Python path to allow imports from ios_bot
@@ -14,18 +15,8 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 # --- End Path fix ---
 
-# --- SFTP Configuration ---
-SERVERS = [
-    {
-        "host": "199.127.62.217", "port": 8822, "user": "kevina", "pass": "43CHso",
-        "dir": "/199.127.62.217_27015/iosoccer/statistics"
-    },
-    {
-        "host": "199.127.63.12", "port": 8822, "user": "kevina", "pass": "43CHso",
-        "dir": "/199.127.63.12_27045/iosoccer/statistics"
-    }
-]
-# ------------------------
+# Import database manager
+from ios_bot.database_manager import get_servers_for_compile_stats
 
 # --- Configuration ---
 # Use absolute paths to ensure the script can be run from anywhere
@@ -33,6 +24,29 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 player_stats_filename = os.path.join(script_dir, 'player_stats.csv')
 match_summaries_filename = os.path.join(script_dir, 'match_summaries.csv')
 last_processed_date_filename = os.path.join(script_dir, 'last_processed_date.txt')
+
+def get_servers_sync():
+    """Get servers from database synchronously."""
+    try:
+        # Create a new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        servers = loop.run_until_complete(get_servers_for_compile_stats())
+        loop.close()
+        
+        if not servers:
+            print("Warning: No servers found in database with SFTP details.")
+            print("Make sure servers have been added with SFTP IP, host username, and host password.")
+            return []
+        
+        for server in servers:
+            print(f"  - {server['host']}:{server['port']} (user: {server['user']})")
+        
+        return servers
+    except Exception as e:
+        print(f"Error getting servers from database: {e}")
+        print("Falling back to empty server list.")
+        return []
 
 def get_last_processed_date():
     """Reads the last processed date from the file."""
@@ -141,6 +155,240 @@ def calculate_player_scores(player_data, stat_map):
     }
     return scores
 
+def analyze_lineups(match_data):
+    """
+    Analyzes the lineup changes throughout a match and returns initial lineups, 
+    final lineups, and substitution summary.
+    """
+    players = match_data["players"]
+    format = match_data["matchInfo"]["format"]
+
+    # Determine position order based on format
+    if format == 8:
+        POSITION_ORDER = ["GK", "LB", "CB", "RB", "CM", "LW", "CF", "RW"]
+    else:
+        POSITION_ORDER = ["GK", "LB", "RB", "CM", "LW", "RW"]
+    
+
+    # Gather all periods for all players
+    periods = []
+    for player in players:
+        info = player["info"]
+        name = info["name"]
+        steamid = info["steamId"]
+        for mpd in player.get("matchPeriodData", []):
+            mpd_info = mpd["info"]
+            team = mpd_info["team"]
+            position = mpd_info["position"]
+            start = mpd_info["startSecond"]
+            end = mpd_info["endSecond"]
+            periods.append({
+                "name": name,
+                "steamid": steamid,
+                "team": team,
+                "position": position,
+                "start": start,
+                "end": end
+            })
+
+    if not periods:
+        return {}, {}, []
+
+    # Find total match time
+    total_match_time = max(p["end"] for p in periods)
+
+    # Build timeline of all changes
+    timeline = []
+    for p in periods:
+        timeline.append((p["start"], "in", p))
+        timeline.append((p["end"], "out", p))
+    timeline.sort(key=lambda x: (x[0], 0 if x[1] == "in" else 1))
+
+    # Initial lineup at t=0
+    initial_lineup = defaultdict(dict)
+    for p in periods:
+        if p["start"] == 0:
+            initial_lineup[p["team"]][p["position"]] = (p["name"], p["steamid"])
+
+    # Track current lineup and player positions
+    current_lineup = defaultdict(dict)
+    player_positions = {}  # (name, steamid) -> (team, pos)
+    seen_players = set()
+    subbed_in_players = set()
+    initial_starters = set()
+    sub_in_for = dict()  # (name, steamid) -> (name, steamid) they replaced
+    swap_events = set()  # (t, team, pos1, pos2) to avoid duplicate swap prints
+
+    # Track a queue of players who left each position and have not yet been replaced
+    left_queue = defaultdict(deque)  # (team, pos) -> deque of (name, steamid, time)
+
+    for team in initial_lineup:
+        for pos in initial_lineup[team]:
+            current_lineup[team][pos] = initial_lineup[team][pos]
+            player_positions[initial_lineup[team][pos]] = (team, pos)
+            seen_players.add(initial_lineup[team][pos])
+            initial_starters.add(initial_lineup[team][pos])
+
+    # To avoid duplicate messages
+    printed_events = set()
+    substitution_pairs = []  # (left_player, subbed_in_player, position, team, time_left, time_in)
+
+    for idx, (t, action, p) in enumerate(timeline):
+        team = p["team"]
+        pos = p["position"]
+        name = p["name"]
+        steamid = p["steamid"]
+        player_key = (name, steamid)
+        key = (team, pos)
+        event_id = (t, action, name, steamid, team, pos)
+        if event_id in printed_events:
+            continue
+        printed_events.add(event_id)
+
+        # Detect swaps: look ahead for another "in" at the same time for the same team
+        if action == "in" and t > 0:
+            # Find if another player is also "in" at this time for the same team
+            for jdx in range(idx + 1, len(timeline)):
+                t2, action2, p2 = timeline[jdx]
+                if t2 != t or action2 != "in":
+                    break
+                team2 = p2["team"]
+                pos2 = p2["position"]
+                name2 = p2["name"]
+                steamid2 = p2["steamid"]
+                # Only allow swaps within the same team and different positions
+                if team2 == team and pos2 != pos:
+                    # Check if both positions were occupied before
+                    if pos in current_lineup[team] and pos2 in current_lineup[team]:
+                        prev1 = current_lineup[team][pos]
+                        prev2 = current_lineup[team][pos2]
+                        # If player1 is subbing into pos2 and player2 is subbing into pos1, it's a swap
+                        if (name2, steamid2) == prev1 and (name, steamid) == prev2:
+                            swap_id = (t, team, pos, pos2)
+                            if swap_id not in swap_events:
+                                sub_in_for[(name, steamid)] = prev2
+                                sub_in_for[(name2, steamid2)] = prev1
+                                subbed_in_players.add((name, steamid))
+                                subbed_in_players.add((name2, steamid2))
+                            break
+            if 'msg' in locals():
+                # Perform the swap in the lineup
+                prev1 = current_lineup[team][pos]
+                prev2 = current_lineup[team][pos2]
+                current_lineup[team][pos] = (name, steamid)
+                current_lineup[team][pos2] = (name2, steamid2)
+                player_positions[(name, steamid)] = (team, pos)
+                player_positions[(name2, steamid2)] = (team, pos2)
+                seen_players.add((name, steamid))
+                seen_players.add((name2, steamid2))
+                continue  # Skip the rest of the logic for this event
+
+        if action == "in":
+            if key in current_lineup[team]:
+                prev_name, prev_steamid = current_lineup[team][pos]
+                prev_key = (prev_name, prev_steamid)
+                if prev_key != player_key:
+                    if player_key in seen_players:
+                        pass
+                    else:
+                        subbed_in_players.add(player_key)
+                        sub_in_for[player_key] = prev_key
+                    seen_players.add(player_key)
+                else:
+                    # Same player, possibly re-entering (rare)
+                    pass
+            else:
+                # If position was empty, always pop from left_queue if available
+                if left_queue[(team, pos)]:
+                    left_name, left_steamid, left_time = left_queue[(team, pos)].popleft()
+                    sub_in_for[player_key] = (left_name, left_steamid)
+                    subbed_in_players.add(player_key)
+                    # Track the substitution pair
+                    substitution_pairs.append((
+                        (left_name, left_steamid),
+                        (name, steamid),
+                        pos,
+                        team,
+                        left_time,
+                        t
+                    ))
+                else:
+                    sub_in_for[player_key] = None
+                    subbed_in_players.add(player_key)
+                seen_players.add(player_key)
+            current_lineup[team][pos] = (name, steamid)
+            player_positions[player_key] = (team, pos)
+        elif action == "out":
+            if key in current_lineup[team] and current_lineup[team][pos][0] == name:
+                del current_lineup[team][pos]
+                if player_key in player_positions:
+                    del player_positions[player_key]
+                left_queue[(team, pos)].append((name, steamid, t))
+
+    # Find match end time
+    match_end_time = total_match_time
+
+    # 1. Find all players who left early (last endSecond < match_end_time)
+    players_left_early = defaultdict(list)  # team -> list of (name, steamid)
+    players_joined_late = defaultdict(list)  # team -> list of (name, steamid, startSecond)
+    player_periods = defaultdict(list)  # (team, steamid) -> list of (start, end, pos)
+
+    for player in players:
+        info = player["info"]
+        name = info["name"]
+        steamid = info["steamId"]
+        periods_this_player = []
+        for mpd in player.get("matchPeriodData", []):
+            mpd_info = mpd["info"]
+            team = mpd_info["team"]
+            pos = mpd_info["position"]
+            start = mpd_info["startSecond"]
+            end = mpd_info["endSecond"]
+            periods_this_player.append((start, end, pos))
+            player_periods[(team, steamid)].append((start, end, pos))
+        if periods_this_player:
+            last_end = max(e for s, e, p in periods_this_player)
+            first_start = min(s for s, e, p in periods_this_player)
+            team = player.get("matchPeriodData", [{}])[0].get("info", {}).get("team", None)
+            if last_end < match_end_time and team:
+                players_left_early[team].append((name, steamid))
+            if first_start > 0 and team:
+                players_joined_late[team].append((name, steamid, first_start))
+
+    # 2. For each team, pair new joiners with leavers in order
+    sub_pairs = {}  # (team, name, steamid) -> (left_name, left_steamid)
+    for team in players_left_early:
+        left_queue = deque(players_left_early[team])
+        for join_name, join_steamid, join_start in sorted(players_joined_late[team], key=lambda x: x[2]):
+            if left_queue:
+                left_name, left_steamid = left_queue.popleft()
+                sub_pairs[(team, join_name, join_steamid)] = (left_name, left_steamid)
+
+    # 3. Output initial lineups, final lineups, and substitute summary as tuples
+    def get_lineup_dict(lineup):
+        result = {}
+        for team in ["away", "home"]:
+            result[team] = []
+            for pos in POSITION_ORDER:
+                if pos in lineup[team]:
+                    name, steamid = lineup[team][pos]
+                    result[team].append((pos, name, steamid))
+                else:
+                    result[team].append((pos, None, None))
+        return result
+
+    initial_lineups = get_lineup_dict(initial_lineup)
+    final_lineups = get_lineup_dict(current_lineup)
+    substitute_summary = []
+    for (team, join_name, join_steamid), (left_name, left_steamid) in sub_pairs.items():
+        substitute_summary.append((
+            team,
+            (left_name, left_steamid),
+            (join_name, join_steamid)
+        ))
+
+    return initial_lineups, final_lineups, substitute_summary
+
 def main():
     print("--- Starting Stats Compilation ---")
 
@@ -157,7 +405,7 @@ def main():
 
     # --- SFTP Connection and file filtering ---
     new_json_files = []
-    for server in SERVERS:
+    for server in get_servers_sync():
         transport, sftp = None, None
         try:
             print(f"Connecting to {server['host']}...")
@@ -264,11 +512,21 @@ def main():
             # --- End KeeperBot Check ---
 
             # --- Game Type Check ---
-            map_name = data.get('matchInfo', {}).get('mapName', '')
-            game_type = '6v6'
-            if re.search(r'8v8', map_name, re.IGNORECASE):
+            not_proper_game = False
+            format = data.get('matchInfo', {}).get('format')
+            if format == 6:
+                game_type = '6v6'
+            if format == 8:
                 game_type = '8v8'
+            else:
+                not_proper_game = True
+                break
+            if not_proper_game:
+                continue
             # --- End Game Type Check ---
+            
+            # --- Lineup Analysis ---
+            initial_lineups, final_lineups, substitution_summary = analyze_lineups(data)
             
             current_stat_types = data['statisticTypes']
             
@@ -292,13 +550,6 @@ def main():
                 print(f"  -> Skipping scoreline for {filename}: Could not find goals in statistics array. Error: {e}")
                 scoreline = "N/A"
 
-            best_performers = {
-                'attacker': {'name': 'N/A', 'steamId': '', 'score': -1}, 'playmaker': {'name': 'N/A', 'steamId': '', 'score': -1},
-                'defender': {'name': 'N/A', 'steamId': '', 'score': -999}, 'goalkeeper': {'name': 'N/A', 'steamId': '', 'score': -999}
-            }
-            
-            all_player_scores = []
-
             for player in data['players']:
                 steam_id, player_name = player['info']['steamId'], player['info']['name']
                 
@@ -314,26 +565,22 @@ def main():
                 for period in player['matchPeriodData']:
                     for i, stat_val in enumerate(period['statistics']):
                         player_match_stats[i] += stat_val
-                
-                scores = {
-                    'attacker': player_match_stats[stat_map['goals']] if 'goals' in stat_map else 0,
-                    'playmaker': sum(player_match_stats[stat_map[s]] for s in ['assists', 'secondAssists', 'chancesCreated', 'keyPasses'] if s in stat_map),
-                    'defender': (player_match_stats[stat_map['interceptions']] if 'interceptions' in stat_map else 0) + \
-                                (player_match_stats[stat_map['slidingTacklesCompleted']] if 'slidingTacklesCompleted' in stat_map else 0) - \
-                                (player_match_stats[stat_map['fouls']] if 'fouls' in stat_map else 0),
-                    'goalkeeper': (player_match_stats[stat_map['keeperSaves']] if 'keeperSaves' in stat_map else 0) + \
-                                  (player_match_stats[stat_map['keeperSavesCaught']] if 'keeperSavesCaught' in stat_map else 0) - \
-                                  (player_match_stats[stat_map['goalsConceded']] if 'goalsConceded' in stat_map else 0)
-                }
 
-                all_player_scores.append({
-                    'steam_id': steam_id, 'player_name': player_name,
-                    'team_name': player_team_name, 'scores': scores
-                })
-
-                for category, score in scores.items():
-                    if score > best_performers[category]['score']:
-                        best_performers[category] = {'name': player_name, 'steamId': steam_id, 'score': score}
+                # Determine player position more robustly
+                player_position = 'N/A'
+                if player.get('matchPeriodData'):
+                    # Collect all positions from all periods to find the most common one
+                    positions = []
+                    for period in player['matchPeriodData']:
+                        pos = period.get('info', {}).get('position')
+                        if pos and pos != 'N/A' and str(pos).lower() not in ['nan', 'null', 'none', '']:
+                            positions.append(pos)
+                    
+                    if positions:
+                        # Find the most common position
+                        from collections import Counter
+                        position_counter = Counter(positions)
+                        player_position = position_counter.most_common(1)[0][0]
 
                 new_player_stat_row = {
                     'match_id': match_id,
@@ -343,23 +590,22 @@ def main():
                     'Team Name': player_team_name,
                     'Opponent Team Name': player_opponent_team_name,
                     'Team Side': player_side,
-                    'Position': player['matchPeriodData'][0]['info']['position'] if player.get('matchPeriodData') else 'N/A',
+                    'Position': player_position,
                 }
                 for i, stat_name in enumerate(current_stat_types):
                     new_player_stat_row[stat_name] = player_match_stats[i]
                 new_player_stats.append(new_player_stat_row)
 
-            def format_performer(cat):
-                perf = best_performers[cat]
-                return f"{perf['name']} : {perf['steamId']} : {perf['score']}" if perf['name'] != 'N/A' else 'N/A'
-
             new_match_summaries.append({
                 'match_id': match_id,
-                'datetime': match_datetime_str, 'home_team': home_team, 'away_team': away_team, 'scoreline': scoreline,
+                'datetime': match_datetime_str, 
+                'home_team': home_team, 
+                'away_team': away_team, 
+                'scoreline': scoreline,
                 'game_type': game_type,
-                'best_attacker': format_performer('attacker'), 'best_playmaker': format_performer('playmaker'),
-                'best_defender': format_performer('defender'), 'best_goalkeeper': format_performer('goalkeeper'),
-                'all_player_scores': json.dumps(all_player_scores)
+                'initial_lineups': json.dumps(initial_lineups),
+                'final_lineups': json.dumps(final_lineups),
+                'substitution_summary': json.dumps(substitution_summary)
             })
             processed_match_ids.add(match_id)
             

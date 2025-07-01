@@ -1,0 +1,36 @@
+# Environment variables (contains sensitive information)
+.env
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+*.log
+
+# Bot-specific files that might contain sensitive data
+*.token
+*.key
+config_local.py
+
+# Temporary files
+*.tmp
+*.temp 
