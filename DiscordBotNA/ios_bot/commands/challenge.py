@@ -227,7 +227,7 @@ class ChallengeAcceptView(View):
                 initiating_channel = initiating_guild.get_channel(challenge_data["initiating_channel_id"])
                 if initiating_channel:
                     await initiating_channel.send(f"ℹ️ Team **{ignored_by_team_name}** has **DECLINED** your {game_type_display} challenge.")
-                    await sm_refresh_lineup(initiating_channel, force_new_message=True) 
+                    await sm_refresh_lineup(initiating_channel, author_override=interaction.user, force_new_message=True)
             except Exception as e:
                 print(f"Error notifying initiator of declined challenge {self.challenge_id}: {e}")
             
@@ -587,7 +587,7 @@ class ChallengeView(View):
             # Refresh initiator's lineup (now VS Main Guild)
             await sm_refresh_lineup(initiating_channel_obj, author_override=interaction.user, force_new_message=False)
             # Refresh main channel's lineup (now VS Initiator)
-            await sm_refresh_lineup(main_channel_obj, author_override=interaction.user, force_new_message=False)
+            await sm_refresh_lineup(main_channel_obj, author_override=interaction.user, force_new_message=True)
 
             final_followup_message = f"✅ Challenge issued to and auto-accepted by **Main Guild {self.game_type.upper()} Channel** ({main_channel_obj.mention})! Your embeds are updated."
             print(f"[CHALLENGE SUCCESS] Team {initiating_team_name} successfully challenged main channel {main_channel_id}")
