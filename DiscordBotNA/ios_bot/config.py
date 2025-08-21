@@ -77,8 +77,8 @@ port = int(os.getenv('DB_PORT', '3306'))
 user = os.getenv('DB_USER')
 password = os.getenv('DB_PASSWORD')  
 database = os.getenv('DB_NAME')
-charset = 'utf8mb4'
-collation = 'utf8mb4_general_ci'
+charset = 'utf8'
+collation = 'utf8_general_ci'
 
 # Constants
 SIXES_MAIN_MATCHMAKING_CHANNELS = []

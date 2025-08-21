@@ -409,34 +409,80 @@ async def refresh_lineup(arg, force_new_message: bool = False, author_override: 
     message_ids = state.get("message_ids", [])
     new_message_ids = [None] * len(message_ids) # Prepare for new IDs if sending new
 
-    # If main channel is challenged, ensure only one message is handled
-    if context_type in ["main_6s", "main_8s"] and challenged_by_team_name:
-        if embeds_and_views: # Should be exactly one
+    # Handle message sending based on context
+    if context_type in ["main_6s","main_8s"] and challenged_by_team_name:
+        # For challenged main channels, only show one message (main guild vs challenger)
+        if embeds_and_views:  # Should be exactly one
             data = embeds_and_views[0]
             current_sent_msg_id = None
-            try:
-                new_msg = await channel.send(embed=data["embed"], view=data["view"])
-                current_sent_msg_id = new_msg.id
-            except discord.HTTPException as e_send:
-                print(f"Failed to send new message (main challenged, force_new={force_new_message}): {e_send}")
             
+            # Delete the second message if it exists (Team 2 embed)
+            if len(message_ids) > 1 and message_ids[1] is not None:
+                try:
+                    old_msg = await channel.fetch_message(message_ids[1])
+                    await old_msg.delete()
+                    print(f"Deleted second embed (Team 2) for challenged main channel {channel.id}")
+                except discord.HTTPException as e:
+                    print(f"Failed to delete second embed for challenged main channel: {e}")
+            
+            # Try to edit existing message first, then send new if needed
+            if not force_new_message and len(message_ids) > 0 and message_ids[0] is not None:
+                try:
+                    existing_msg = await channel.fetch_message(message_ids[0])
+                    await existing_msg.edit(embed=data["embed"], view=data["view"])
+                    current_sent_msg_id = message_ids[0]  # Keep the same message ID
+                    print(f"Edited existing message for challenged main channel {channel.id}")
+                except discord.HTTPException as e:
+                    print(f"Failed to edit existing message, sending new one: {e}")
+                    try:
+                        new_msg = await channel.send(embed=data["embed"], view=data["view"])
+                        current_sent_msg_id = new_msg.id
+                    except discord.HTTPException as e_send:
+                        print(f"Failed to send new message (main challenged): {e_send}")
+            else:
+                # Send new message
+                try:
+                    new_msg = await channel.send(embed=data["embed"], view=data["view"])
+                    current_sent_msg_id = new_msg.id
+                except discord.HTTPException as e_send:
+                    print(f"Failed to send new message (main challenged, force_new={force_new_message}): {e_send}")
+            
+            # Update message IDs - keep only one message for challenged main channel
             if not isinstance(state.get("message_ids"), list) or len(state["message_ids"]) == 0:
-                state["message_ids"] = [None] # Initialize for one message
-
+                state["message_ids"] = [None]
+            
             state["message_ids"][0] = current_sent_msg_id
             
+            # Clear the second message ID if it exists (this will cause the second embed to be deleted)
             if len(state["message_ids"]) > 1:
-                 state["message_ids"][1] = None
-
-    else: # Standard processing for team channels or non-challenged main channels
+                state["message_ids"][1] = None
+    else:
+        # Standard processing for team channels or non-challenged main channels
         temp_new_ids_for_state = [None] * len(embeds_and_views)
         for idx, data in enumerate(embeds_and_views):
             current_sent_id_for_embed = None
-            try:
-                new_msg = await channel.send(embed=data["embed"], view=data["view"])
-                current_sent_id_for_embed = new_msg.id
-            except discord.HTTPException as e_send:
-                print(f"Failed to send new message (standard, force_new={force_new_message}): {e_send}")
+            
+            # Try to edit existing message first, then send new if needed
+            if not force_new_message and idx < len(message_ids) and message_ids[idx] is not None:
+                try:
+                    existing_msg = await channel.fetch_message(message_ids[idx])
+                    await existing_msg.edit(embed=data["embed"], view=data["view"])
+                    current_sent_id_for_embed = message_ids[idx]  # Keep the same message ID
+                    print(f"Edited existing message {idx + 1} for channel {channel.id}")
+                except discord.HTTPException as e:
+                    print(f"Failed to edit existing message {idx + 1}, sending new one: {e}")
+                    try:
+                        new_msg = await channel.send(embed=data["embed"], view=data["view"])
+                        current_sent_id_for_embed = new_msg.id
+                    except discord.HTTPException as e_send:
+                        print(f"Failed to send new message (team {idx + 1}): {e_send}")
+            else:
+                # Send new message
+                try:
+                    new_msg = await channel.send(embed=data["embed"], view=data["view"])
+                    current_sent_id_for_embed = new_msg.id
+                except discord.HTTPException as e_send:
+                    print(f"Failed to send new message (team {idx + 1}, force_new={force_new_message}): {e_send}")
             
             if idx < len(temp_new_ids_for_state):
                  temp_new_ids_for_state[idx] = current_sent_id_for_embed

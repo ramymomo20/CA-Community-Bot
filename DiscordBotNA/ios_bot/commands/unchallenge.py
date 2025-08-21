@@ -124,10 +124,9 @@ async def unchallenge_command(ctx: ApplicationContext):
                         # Clear challenge flags from main channel state
                         main_channel_state = get_channel_state(opponent_channel_id)
                         if main_channel_state:
-                            if "is_challenged_by_team_name" in main_channel_state:
-                                del main_channel_state["is_challenged_by_team_name"]
-                            if "active_challenge_game_type" in main_channel_state:
-                                del main_channel_state["active_challenge_game_type"]
+                            # Import and use the helper function
+                            from ios_bot.commands.challenge import clear_main_channel_challenge_flags
+                            clear_main_channel_challenge_flags(main_channel_state)
                             if len(main_channel_state.get("message_ids", [])) > 1 and main_channel_state["message_ids"][1] is None:
                                 print(f"Info: Unchallenge (main) found message_ids[1] as None, refresh_lineup will send new.")
                         

@@ -1,14 +1,14 @@
 from ios_bot.config import *
 from ios_bot.signup_manager import get_all_channel_ids_with_state, clear_and_refresh_channel, get_channel_state, update_state, refresh_lineup as sm_refresh_lineup
 from ios_bot.challenge_manager import active_challenges
-from ios_bot.database_manager import get_team_by_name, pop_active_match_channel
+from ios_bot.database_manager import get_team_by_name, execute_query
 import subprocess
 import sys
 import csv
 
 # Define the target time in Eastern Time (New York)
-cet_timezone = pytz.timezone('CET')
-clear_time = time(2, 0, 0, tzinfo=cet_timezone)
+est_timezone = pytz.timezone('EST')
+clear_time = time(5, 0, 0, tzinfo=est_timezone)
 
 # --- Task State ---
 # This set will keep track of the datetimes of matches that have already been announced
@@ -16,36 +16,68 @@ announced_match_datetimes = set()
 
 @tasks.loop(time=clear_time)
 async def clear_all_lineups():
-    """A scheduled task to clear all matchmaking lineups daily at 2 AM Eastern Time."""
+    """A scheduled task to clear all matchmaking lineups daily at 25 AM Eastern Time."""
     try:
-        print(f"[{datetime.now(cet_timezone).strftime('%Y-%m-%d %H:%M:%S %Z')}] Running daily lineup clear...")
+        print(f"[{datetime.now(est_timezone).strftime('%Y-%m-%d %H:%M:%S %Z')}] Running daily lineup clear...")
         
         all_channel_ids = get_all_channel_ids_with_state()
         if not all_channel_ids:
             print("No active channel states found to clear.")
-            return
-
-        cleared_count = 0
-        for channel_id in all_channel_ids:
-            try:
-                channel = bot.get_channel(channel_id)
-                if channel and isinstance(channel, discord.TextChannel):
-                    await clear_and_refresh_channel(channel)
-                    cleared_count += 1
-                    await asyncio.sleep(1) # Avoid rate-limiting
-            except Exception as e:
-                print(f"Error clearing lineup for channel {channel_id}: {e}")
+        else:
+            cleared_count = 0
+            for channel_id in all_channel_ids:
+                try:
+                    channel = bot.get_channel(channel_id)
+                    if channel and isinstance(channel, discord.TextChannel):
+                        await clear_and_refresh_channel(channel)
+                        cleared_count += 1
+                        await asyncio.sleep(1) # Avoid rate-limiting
+                except Exception as e:
+                    print(f"Error clearing lineup for channel {channel_id}: {e}")
 
         print(f"Daily lineup clear finished. Cleared {cleared_count} channels.")
+        
+        # Clean up stale challenges during the daily clear
+        print(f"[{datetime.now(est_timezone).strftime('%Y-%m-%d %H:%M:%S %Z')}] Cleaning up stale challenges...")
+        await cleanup_stale_challenges()
+        
     except Exception as e:
         print(f"Critical error in clear_all_lineups task: {e}")
         # Don't re-raise - let the bot continue running
+
+async def cleanup_stale_challenges():
+    """Remove challenges that are older than 24 hours."""
+    try:
+        from datetime import timedelta
+        
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
+        stale_challenges = []
+        
+        for challenge_id, challenge in list(active_challenges.items()):
+            challenge_time = challenge.get('challenge_time')
+            if challenge_time and challenge_time < cutoff_time:
+                stale_challenges.append(challenge_id)
+        
+        if stale_challenges:
+            for challenge_id in stale_challenges:
+                try:
+                    del active_challenges[challenge_id]
+                    print(f"  - Removed stale challenge: {challenge_id}")
+                except KeyError:
+                    pass  # Challenge already removed
+            
+            print(f"Cleaned up {len(stale_challenges)} stale challenges.")
+        else:
+            print("No stale challenges found.")
+            
+    except Exception as e:
+        print(f"Error cleaning up stale challenges: {e}")
 
 @tasks.loop(minutes=15)
 async def check_inactive_players():
     """A task to automatically remove inactive players from lineups."""
     try:
-        print(f"[{datetime.now(cet_timezone).strftime('%Y-%m-%d %H:%M:%S %Z')}] Checking for inactive players...")
+        print(f"[{datetime.now(est_timezone).strftime('%Y-%m-%d %H:%M:%S %Z')}] Checking for inactive players...")
         inactive_threshold = timedelta(minutes=120)
         now = datetime.now(timezone.utc)
         
@@ -122,17 +154,16 @@ async def check_inactive_players():
         print(f"Critical error in check_inactive_players task: {e}")
         # Don't re-raise - let the bot continue running
 
-@tasks.loop(minutes=5)  # Changed from 2 minutes to 5 to reduce load
+@tasks.loop(minutes=15)  # Changed from 5 minutes to 15 to reduce load and prevent startup issues
 async def refresh_statistics():
-    """A task to refresh the player and match statistics by running the compilation script."""
+    """A task to refresh the player and match statistics and sync with database."""
     try:
-        print(f"[{datetime.now(cet_timezone).strftime('%Y-%m-%d %H:%M:%S %Z')}] Running scheduled stats refresh...")
+        print(f"[{datetime.now(est_timezone).strftime('%Y-%m-%d %H:%M:%S %Z')}] Running scheduled stats refresh...")
         
-        # Construct the path to the compile_stats.py script
+        # First, run the compilation script to update CSV files
         script_path = os.path.join(os.path.dirname(__file__), 'ratings', 'compile_stats.py')
         python_executable = sys.executable  # Use the same python that's running the bot
 
-        # We use asyncio.to_thread to run the blocking subprocess call without blocking the bot's event loop.
         proc = await asyncio.to_thread(
             subprocess.run,
             [python_executable, script_path],
@@ -142,26 +173,53 @@ async def refresh_statistics():
         )
         
         if proc.returncode == 0:
-            print("Stats compilation script finished successfully.")
-            # Optionally log the script's output for debugging
+            print("✅ Stats compilation script finished successfully.")
             if proc.stdout:
                 print("Script output:\n", proc.stdout)
+                
+            # Import CSV data to database using new simplified method (with timeout protection)
+            print("🚀 Importing ALL CSV data to database (0 for unregistered teams)...")
+            try:
+                # Add timeout to prevent hanging during scheduled sync
+                from ios_bot.database_manager import import_all_csv_data_with_nulls
+                success = await asyncio.wait_for(import_all_csv_data_with_nulls(), timeout=300.0)  # 5 minute timeout
+                if success:
+                    print("✅ Fast database import completed successfully.")
+                    
+                    # Print simple health status
+                    try:
+                        match_count = await execute_query("SELECT COUNT(*) as count FROM MATCH_STATS", fetchone=True)
+                        player_count = await execute_query("SELECT COUNT(*) as count FROM PLAYER_MATCH_DATA", fetchone=True)
+                        mapping_count = await execute_query("SELECT COUNT(*) as count FROM TEAM_NAME_MAPPINGS", fetchone=True)
+                        
+                        print(f"📊 Database Status:")
+                        print(f"  - Matches: {match_count['count'] if match_count else 0}")
+                        print(f"  - Player Records: {player_count['count'] if player_count else 0}")
+                        print(f"  - Team Mappings: {mapping_count['count'] if mapping_count else 0}")
+                    except Exception as e:
+                        print(f"⚠️ Could not get database statistics: {e}")
+                else:
+                    print("❌ Fast database import failed.")
+            except asyncio.TimeoutError:
+                print("❌ Fast database import timed out after 5 minutes during scheduled task.")
+            except Exception as e:
+                print(f"❌ Error during fast database import: {e}")
         else:
-            print(f"Stats compilation script finished with return code: {proc.returncode}")
+            print(f"❌ Stats compilation script finished with return code: {proc.returncode}")
             if proc.stderr:
                 print("Script errors:\n", proc.stderr)
 
     except subprocess.TimeoutExpired:
-        print("Stats compilation script timed out after 5 minutes")
+        print("❌ Stats compilation script timed out after 5 minutes")
     except FileNotFoundError:
-        print(f"Error: The script at {script_path} was not found.")
+        print(f"❌ Error: The script at {script_path} was not found.")
     except subprocess.CalledProcessError as e:
-        print(f"Error executing stats compilation script:")
+        print(f"❌ Error executing stats compilation script:")
         print(f"Return Code: {e.returncode}")
         print(f"Output:\n{e.stdout}")
         print(f"Error Output:\n{e.stderr}")
     except Exception as e:
-        print(f"An unexpected error occurred while running the stats refresh task: {e}")
+        print(f"❌ An unexpected error occurred while running the stats refresh task: {e}")
     
     # Never re-raise exceptions from this task to prevent bot crashes
 
@@ -219,6 +277,9 @@ async def check_and_announce_new_matches():
                 
                 # Mark this match as announced
                 announced_match_datetimes.add(match_dt)
+                
+                # The database sync happens in refresh_statistics task, so no need to duplicate here
+                
             except Exception as e:
                 print(f"[Match Announcer] Error processing match: {e}")
     except Exception as e:

@@ -23,3 +23,4 @@ from .register_me import register_me
 from .view_match import view_match
 from .server_management import edit_servers
 from .tournament_system import register_tournament, view_tournament, delete_tournament_command
+from .team_mapping import cleanup_placeholder_teams_command

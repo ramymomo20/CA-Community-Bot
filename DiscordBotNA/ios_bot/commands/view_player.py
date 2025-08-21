@@ -1,31 +1,50 @@
-from collections import Counter
 from ios_bot.config import *
-from ios_bot.database_manager import get_player_teams, get_player_by_discord_id
-from PIL import Image, ImageDraw, ImageFont
-import requests
-import io
-import tempfile
+from ios_bot.database_manager import get_player_by_discord_id, get_player_teams
 import csv
 import os
+import io
+from PIL import Image, ImageDraw, ImageFont
+import requests
+from io import BytesIO
+from collections import Counter
+import tempfile
+from datetime import datetime, timezone
 
 class PlayerStatsView(discord.ui.View):
-    def __init__(self, user, club_team_info, national_team_info, club_team_position, club_team_stats, club_team_appearances, national_team_position, national_team_stats, national_team_appearances, all_time_pos, all_time_stats, total_appearances, card_path, player_rating):
+    def __init__(self, user, club_team_info, national_team_info, mix_team_info, club_team_position, club_team_stats, club_team_appearances, national_team_position, national_team_stats, national_team_appearances, mix_team_position, mix_team_stats, mix_team_appearances, all_time_pos, all_time_stats, total_appearances, card_path, player_rating, steam_id):
         super().__init__(timeout=180)
         self.user = user
         self.club_team_info = club_team_info
         self.national_team_info = national_team_info
+        self.mix_team_info = mix_team_info
         self.club_team_position = club_team_position
         self.club_team_stats = club_team_stats
         self.club_team_appearances = club_team_appearances
         self.national_team_position = national_team_position
         self.national_team_stats = national_team_stats
         self.national_team_appearances = national_team_appearances
+        self.mix_team_position = mix_team_position
+        self.mix_team_stats = mix_team_stats
+        self.mix_team_appearances = mix_team_appearances
         self.all_time_pos = all_time_pos
         self.all_time_stats = all_time_stats
         self.total_appearances = total_appearances
         self.card_path = card_path
         self.player_rating = player_rating
+        self.steam_id = steam_id
         self.current_page = 0
+
+        # Define available pages based on what data we have
+        self.pages = ["all_time"]  # Always show all-time stats
+        
+        if self.club_team_info:
+            self.pages.append("club")
+        if self.national_team_info:
+            self.pages.append("national")
+        if self.mix_team_info:
+            self.pages.append("mix")
+        if self.total_appearances > 0:  # Only show weekly if player has stats
+            self.pages.append("weekly")
         
     def create_club_stats_embed(self):
         """Create the detailed club team stats embed (Page 2)"""
@@ -41,17 +60,23 @@ class PlayerStatsView(discord.ui.View):
         if self.club_team_info and self.club_team_info.get('image_url'):
             embed.set_thumbnail(url=self.club_team_info['image_url'])
         
-        embed.set_author(name=f"{self.user.display_name}", icon_url=self.user.display_avatar.url)
+        embed.set_author(name=self.user.display_name, icon_url=self.user.display_avatar.url)
         
         if self.club_team_info:
-            team_name = self.club_team_info['name']
-            captain_text = " (CAPTAIN)" if is_captain else ""
-            embed.add_field(name="**Team**", value=f"`{team_name}`{captain_text}", inline=True)
+            team_name = self.club_team_info.get('name') or self.club_team_info.get('guild_name', 'Unknown Team')
+            is_vice_captain = self.club_team_info.get('vice_captain_id') == self.user.id
+            if is_captain:
+                role_text = " (CAPTAIN)"
+            elif is_vice_captain:
+                role_text = " (VICE CAPTAIN)"
+            else:
+                role_text = ""
+            embed.add_field(name="**Team**", value=f"`{team_name}`{role_text}", inline=True)
         else:
             embed.add_field(name="**Team**", value="FREE AGENT", inline=True)
             
         embed.add_field(name="**Position**", value=f"`{self.club_team_position or 'N/A'}`", inline=True)
-        embed.add_field(name="**Appearances**", value=f"`{self.club_team_appearances}`", inline=True)
+        embed.add_field(name="**Appearances**", value=f"`{self.club_team_appearances}`", inline=True)        
         
         # Add player rating as a non-inline field
         if self.player_rating is not None:
@@ -209,6 +234,205 @@ class PlayerStatsView(discord.ui.View):
             embed.add_field(name="**Stats**", value="No competitive stats found.", inline=False)
             
         embed.set_footer(text="Page 1/3 - All-Time Stats • Use buttons to navigate")
+        return embed
+
+
+    def create_mix_team_stats_embed(self):
+        """Create the detailed mix team stats embed"""
+        is_captain = self.mix_team_info and self.mix_team_info.get('captain_id') == self.user.id
+        color = discord.Color.green() if is_captain else discord.Color.orange()
+        
+        embed = discord.Embed(
+            title=f"🎯 {self.user.display_name} - Mix Team Stats",
+            color=color
+        )
+        
+        # Set team image as thumbnail if available
+        if self.mix_team_info and self.mix_team_info.get('image_url'):
+            embed.set_thumbnail(url=self.mix_team_info['image_url'])
+        
+        embed.set_author(name=self.user.display_name, icon_url=self.user.display_avatar.url)
+        
+        if self.mix_team_info:
+            team_name = self.mix_team_info.get('name') or self.mix_team_info.get('guild_name', 'Unknown Team')
+            is_vice_captain = self.mix_team_info.get('vice_captain_id') == self.user.id
+            if is_captain:
+                role_text = " (CAPTAIN)"
+            elif is_vice_captain:
+                role_text = " (VICE CAPTAIN)"
+            else:
+                role_text = ""
+            embed.add_field(name="**Team**", value=f"`{team_name}`{role_text}", inline=True)
+        else:
+            embed.add_field(name="**Team**", value="FREE AGENT", inline=True)
+            
+        embed.add_field(name="**Position**", value=f"`{self.mix_team_position or 'N/A'}`", inline=True)
+        embed.add_field(name="**Appearances**", value=f"`{self.mix_team_appearances}`", inline=True)
+        
+        # Add player rating as a non-inline field
+        if self.player_rating is not None:
+            embed.add_field(name="🌟 **Player Rating**", value=f"`{self.player_rating:.2f}/10.0`", inline=False)
+        else:
+            embed.add_field(name="🌟 **Player Rating**", value="`Not Available`", inline=False)
+        
+        if self.mix_team_stats and self.mix_team_appearances > 0:
+            # Attacking stats
+            attacking_stats = [
+                f"**Goals:** `{int(float(self.mix_team_stats.get('goals', 0)))}`",
+                f"**Assists:** `{int(float(self.mix_team_stats.get('assists', 0)))}`",
+                f"**2nd Assists:** `{int(float(self.mix_team_stats.get('secondAssists', 0)))}`",
+                f"**Shots:** `{int(float(self.mix_team_stats.get('shots', 0)))}`",
+                f"**Shots on Goal:** `{int(float(self.mix_team_stats.get('shotsOnGoal', 0)))}`",
+                f"**Offsides:** `{int(float(self.mix_team_stats.get('offsides', 0)))}`"
+            ]
+            embed.add_field(name="⚽ **Attacking**", value="\n".join(attacking_stats), inline=True)
+            
+            # Playmaking stats
+            playmaking_stats = [
+                f"**Chances Created:** `{int(float(self.mix_team_stats.get('chancesCreated', 0)))}`",
+                f"**Key Passes:** `{int(float(self.mix_team_stats.get('keyPasses', 0)))}`",
+                f"**Passes:** `{int(float(self.mix_team_stats.get('passes', 0)))}`",
+                f"**Passes Completed:** `{int(float(self.mix_team_stats.get('passesCompleted', 0)))}`",
+                f"**Corners:** `{int(float(self.mix_team_stats.get('corners', 0)))}`",
+                f"**Free Kicks:** `{int(float(self.mix_team_stats.get('freeKicks', 0)))}`"
+            ]
+            
+            # Calculate pass completion percentage
+            passes = int(float(self.mix_team_stats.get('passes', 0)))
+            passes_completed = int(float(self.mix_team_stats.get('passesCompleted', 0)))
+            pass_rate = f"{passes_completed/passes:.1%}" if passes > 0 else "0%"
+            playmaking_stats.append(f"**Pass Rate:** `{pass_rate}`")
+            
+            embed.add_field(name="🎯 **Playmaking**", value="\n".join(playmaking_stats), inline=True)
+            
+            # Defensive stats
+            defensive_stats = [
+                f"**Interceptions:** `{int(float(self.mix_team_stats.get('interceptions', 0)))}`",
+                f"**Tackles:** `{int(float(self.mix_team_stats.get('slidingTacklesCompleted', 0)))}`",
+                f"**Tackle Attempts:** `{int(float(self.mix_team_stats.get('slidingTackles', 0)))}`",
+                f"**Fouls:** `{int(float(self.mix_team_stats.get('fouls', 0)))}`",
+                f"**Fouls Suffered:** `{int(float(self.mix_team_stats.get('foulsSuffered', 0)))}`",
+                f"**Own Goals:** `{int(float(self.mix_team_stats.get('ownGoals', 0)))}`"
+            ]
+            embed.add_field(name="🛡️ **Defensive**", value="\n".join(defensive_stats), inline=True)
+            
+            temp_saves = int(float(self.mix_team_stats.get('keeperSaves')))
+            temp_caught = int(float(self.mix_team_stats.get('keeperSavesCaught')))
+            temp_conceded = int(float(self.mix_team_stats.get('goalsConceded')))
+            
+            # Goalkeeper stats (if applicable)
+            if temp_saves > 0 or temp_conceded > 0:
+                save_rate = f"{temp_saves/(temp_saves + temp_conceded):.1%}" if (temp_saves + temp_conceded) > 0 else "0%"
+                goalkeeper_stats = [
+                    f"**Saves:** `{temp_saves}`",
+                    f"**Saves Caught:** `{temp_caught}`",
+                    f"**Goals Conceded:** `{temp_conceded}`",
+                    f"**Save Rate:** `{save_rate}`"
+                ]
+                embed.add_field(name="🥅 **Goalkeeper**", value="\n".join(goalkeeper_stats), inline=True)
+        
+        embed.set_footer(text="Mix Team Stats • SteamID: {self.steam_id}")
+        embed.timestamp = datetime.now(timezone.utc)
+        
+        return embed
+        
+    def create_national_team_stats_embed(self):
+        """Create the detailed national team stats embed"""
+        is_captain = self.national_team_info and self.national_team_info.get('captain_id') == self.user.id
+        color = discord.Color.red() if is_captain else discord.Color.dark_red()
+        
+        embed = discord.Embed(
+            title=f"🏆 {self.user.display_name} - National Team Stats",
+            color=color
+        )
+        
+        # Set team image as thumbnail if available
+        if self.national_team_info and self.national_team_info.get('image_url'):
+            embed.set_thumbnail(url=self.national_team_info['image_url'])
+        
+        embed.set_author(name=self.user.display_name, icon_url=self.user.display_avatar.url)
+        
+        if self.national_team_info:
+            team_name = self.national_team_info.get('name') or self.national_team_info.get('guild_name', 'Unknown Team')
+            is_vice_captain = self.national_team_info.get('vice_captain_id') == self.user.id
+            if is_captain:
+                role_text = " (CAPTAIN)"
+            elif is_vice_captain:
+                role_text = " (VICE CAPTAIN)"
+            else:
+                role_text = ""
+            embed.add_field(name="**Team**", value=f"`{team_name}`{role_text}", inline=True)
+        else:
+            embed.add_field(name="**Team**", value="FREE AGENT", inline=True)
+            
+        embed.add_field(name="**Position**", value=f"`{self.national_team_position or 'N/A'}`", inline=True)
+        embed.add_field(name="**Appearances**", value=f"`{self.national_team_appearances}`", inline=True)
+        
+        # Add player rating as a non-inline field
+        if self.player_rating is not None:
+            embed.add_field(name="🌟 **Player Rating**", value=f"`{self.player_rating:.2f}/10.0`", inline=False)
+        else:
+            embed.add_field(name="🌟 **Player Rating**", value="`Not Available`", inline=False)
+        
+        if self.national_team_stats and self.national_team_appearances > 0:
+            # Attacking stats
+            attacking_stats = [
+                f"**Goals:** `{int(float(self.national_team_stats.get('goals', 0)))}`",
+                f"**Assists:** `{int(float(self.national_team_stats.get('assists', 0)))}`",
+                f"**2nd Assists:** `{int(float(self.national_team_stats.get('secondAssists', 0)))}`",
+                f"**Shots:** `{int(float(self.national_team_stats.get('shots', 0)))}`",
+                f"**Shots on Goal:** `{int(float(self.national_team_stats.get('shotsOnGoal', 0)))}`",
+                f"**Offsides:** `{int(float(self.national_team_stats.get('offsides', 0)))}`"
+            ]
+            embed.add_field(name="⚽ **Attacking**", value="\n".join(attacking_stats), inline=True)
+            
+            # Playmaking stats
+            playmaking_stats = [
+                f"**Chances Created:** `{int(float(self.national_team_stats.get('chancesCreated', 0)))}`",
+                f"**Key Passes:** `{int(float(self.national_team_stats.get('keyPasses', 0)))}`",
+                f"**Passes:** `{int(float(self.national_team_stats.get('passes', 0)))}`",
+                f"**Passes Completed:** `{int(float(self.national_team_stats.get('passesCompleted', 0)))}`",
+                f"**Corners:** `{int(float(self.national_team_stats.get('corners', 0)))}`",
+                f"**Free Kicks:** `{int(float(self.national_team_stats.get('freeKicks', 0)))}`"
+            ]
+            
+            # Calculate pass completion percentage
+            passes = int(float(self.national_team_stats.get('passes', 0)))
+            passes_completed = int(float(self.national_team_stats.get('passesCompleted', 0)))
+            pass_rate = f"{passes_completed/passes:.1%}" if passes > 0 else "0%"
+            playmaking_stats.append(f"**Pass Rate:** `{pass_rate}`")
+            
+            embed.add_field(name="🎯 **Playmaking**", value="\n".join(playmaking_stats), inline=True)
+            
+            # Defensive stats
+            defensive_stats = [
+                f"**Interceptions:** `{int(float(self.national_team_stats.get('interceptions', 0)))}`",
+                f"**Tackles:** `{int(float(self.national_team_stats.get('slidingTacklesCompleted', 0)))}`",
+                f"**Tackle Attempts:** `{int(float(self.national_team_stats.get('slidingTackles', 0)))}`",
+                f"**Fouls:** `{int(float(self.national_team_stats.get('fouls', 0)))}`",
+                f"**Fouls Suffered:** `{int(float(self.national_team_stats.get('foulsSuffered', 0)))}`",
+                f"**Own Goals:** `{int(float(self.national_team_stats.get('ownGoals', 0)))}`"
+            ]
+            embed.add_field(name="🛡️ **Defensive**", value="\n".join(defensive_stats), inline=True)
+            
+            temp_saves = int(float(self.national_team_stats.get('keeperSaves')))
+            temp_caught = int(float(self.national_team_stats.get('keeperSavesCaught')))
+            temp_conceded = int(float(self.national_team_stats.get('goalsConceded')))
+            
+            # Goalkeeper stats (if applicable)
+            if temp_saves > 0 or temp_conceded > 0:
+                save_rate = f"{temp_saves/(temp_saves + temp_conceded):.1%}" if (temp_saves + temp_conceded) > 0 else "0%"
+                goalkeeper_stats = [
+                    f"**Saves:** `{temp_saves}`",
+                    f"**Saves Caught:** `{temp_caught}`",
+                    f"**Goals Conceded:** `{temp_conceded}`",
+                    f"**Save Rate:** `{save_rate}`"
+                ]
+                embed.add_field(name="🥅 **Goalkeeper**", value="\n".join(goalkeeper_stats), inline=True)
+        
+        embed.set_footer(text="National Team Stats • SteamID: {self.steam_id}")
+        embed.timestamp = datetime.now(timezone.utc)
+        
         return embed
         
     def create_weekly_breakdown_embed(self):
@@ -648,6 +872,44 @@ async def generate_player_card(user, club_team_info, national_team_info, team_po
 
 @bot.slash_command(name="view_player", description="View a player's stats and teams.")
 async def view_player(interaction: discord.Interaction, user: discord.Member):
+    """Shows a player card with their teams and stats."""
+    await view_player_logic(interaction, user)
+
+@bot.slash_command(name="player_stats", description="View a player's stats and teams (alternative command).")
+async def player_stats(interaction: discord.Interaction, username: str):
+    """Alternative command that takes a username string instead of Member object."""
+    await interaction.response.defer()
+    
+    # Try to find the user by username
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
+        return
+    
+    # Remove @ if present
+    username = username.strip().lstrip('@')
+    
+    # Try to find the member
+    member = None
+    try:
+        # First try exact match
+        member = guild.get_member_named(username)
+        if not member:
+            # Try case-insensitive search
+            for guild_member in guild.members:
+                if guild_member.name.lower() == username.lower() or guild_member.display_name.lower() == username.lower():
+                    member = guild_member
+                    break
+    except Exception as e:
+        print(f"Error finding member: {e}")
+    
+    if not member:
+        await interaction.followup.send(f"Could not find a user named '{username}' in this server.", ephemeral=True)
+        return
+    
+    await view_player_logic(interaction, member)
+
+async def view_player_logic(interaction: discord.Interaction, user: discord.Member):
     """Shows a player card with their teams and stats."""
     await interaction.response.defer()
 

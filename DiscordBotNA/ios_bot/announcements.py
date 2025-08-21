@@ -1,6 +1,6 @@
 from ios_bot.config import * # Import bot to get channel
 
-async def send_announcement(message_content: str = None, embed: discord.Embed = None, boolSend = False):
+async def send_announcement(message_content: str = "", embed: discord.Embed = None, boolSend = False):
     """Sends a message or an embed to the predefined announcement channel."""
     try:
         announcement_channel = bot.get_channel(MAIN_CHALLENGE_ANNOUNCEMENT_CHANNEL_ID)
@@ -19,7 +19,7 @@ async def announce_challenge_issued(initiating_team_name: str, target_descriptio
     message = f"⚔️ **{initiating_team_name}** has challenged **{target_description}** to a **{game_type.upper()}** match in {initiating_channel_mention} *Challenge ID: `{challenge_id}`*"
     await send_announcement(message_content=message)
 
-async def announce_match_ready(home_team_name: str, opponent_team_name: str, game_type: str, initiating_channel_mention: str, embed_to_send: discord.Embed, content_to_send: str = None):
+async def announce_match_ready(home_team_name: str, opponent_team_name: str, game_type: str, initiating_channel_mention: str, embed_to_send: discord.Embed, content_to_send: str = ""):
     """Announces a match is ready and sends a detailed embed."""
     # The original message construction is now handled by the embed passed in.
     # We can use content_to_send for any additional pings or brief text alongside the embed.

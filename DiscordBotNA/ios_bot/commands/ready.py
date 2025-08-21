@@ -17,6 +17,7 @@ from ios_bot.commands.utils import delete_after_delay, move_sub_to_position # Ad
 from ios_bot.challenge_manager import active_challenges
 from ios_bot.announcements import announce_match_ready # Added import
 from ios_bot.database_manager import add_active_match, get_team_by_name, get_all_servers, get_server_by_name
+from ios_bot.commands.request_sub import get_server_status, get_server_status_sync
 
 import time as clock
 
@@ -25,10 +26,7 @@ import time as clock
 # which can be dynamically updated by the new /edit_main_server command.
 
 # Available maps per format
-MAP_POOLS = {
-    "6v6": ["6v6_peacock_park", "6v6_south"],
-    "8v8": ["8v8_london", "8v8_coral"]
-}
+MAP_POOLS = {"8v8": ["8v8_coral","8v8_italia", "8v8_london", "8v8_vienna"]}
 
 # --- Global variable to control lineup checks for testing ---
 SKIP_LINEUP_CHECKS_FOR_TESTING = False
@@ -41,22 +39,6 @@ class ReadyView(View):
         self.guild_id = guild_id
         self.channel_id = channel_id
 
-        self.ready_button = Button(label="Ready", style=ButtonStyle.success, custom_id=f"matchready_ready_{channel_id}")
-        self.ready_button.callback = self.ready_callback
-        self.add_item(self.ready_button)
-
-        self.unready_button = Button(label="Unready", style=ButtonStyle.danger, custom_id=f"matchready_unready_{channel_id}")
-        self.unready_button.callback = self.unready_callback
-        self.add_item(self.unready_button)
-
-    async def ready_callback(self, interaction: Interaction):
-        # await interaction.response.defer() # Deferring in handle_ready_logic if needed
-        await handle_ready_logic(interaction, self.guild_id, self.channel_id, "ready")
-
-    async def unready_callback(self, interaction: Interaction):
-        # await interaction.response.defer()
-        await handle_ready_logic(interaction, self.guild_id, self.channel_id, "unready")
-
 def check_match_readiness(initiator_state: dict, opponent_state: dict = None, game_type: str = "8s") -> tuple[bool, str]:
     """
     Checks if involved teams are ready for a match.
@@ -67,6 +49,16 @@ def check_match_readiness(initiator_state: dict, opponent_state: dict = None, ga
     positions = EIGHTS_POSITIONS if game_type == "8s" else SIXES_POSITIONS
     teams_to_check = []
     team_names_for_error_msgs = [] # For more precise error messages
+
+    # Validate input states
+    if not initiator_state:
+        return False, "Error: Initiator state is missing or invalid."
+    
+    if not isinstance(initiator_state, dict):
+        return False, "Error: Initiator state is not a valid dictionary."
+    
+    if opponent_state and not isinstance(opponent_state, dict):
+        return False, "Error: Opponent state is not a valid dictionary."
 
     # This check is now handled inside ready_slash
     # if SKIP_LINEUP_CHECKS_FOR_TESTING:
@@ -153,68 +145,27 @@ def check_match_readiness(initiator_state: dict, opponent_state: dict = None, ga
 
     return True, "Teams are ready to proceed!"
 
-def get_server_name_sync(addr: str, passwd: str) -> str: # MODIFIED: Removed async
-    """Get the server name using RCON (synchronous part)"""
-    # This function contains the actual blocking RCON logic
-    try:
-        host, port = addr.split(":")
-        port = int(port)
-        with Client(host, port, passwd=passwd) as client:
-            response = client.run("status")
-            first_line = response.split('\n')[0].strip()
-            if "hostname: " in first_line:
-                server_name = first_line.split("hostname: ", 1)[1]
-            else:
-                server_name = first_line
-            return server_name
-    except Exception as e:
-        # It's better to let the specific RCON errors propagate or handle them carefully
-        # For now, re-raising a general exception to be caught by the caller
-        # print(f"RCON Error in get_server_name_sync: {e}") # Optional logging
-        raise Exception(f"Server is currently unavailable or RCON error: {e}")
+# Use the get_server_status functions from request_sub.py to avoid duplication
 
-
-async def get_server_name(addr: str, passwd: str) -> str:
-    """Get the server name using RCON, non-blocking via asyncio.to_thread."""
-    loop = asyncio.get_running_loop()
-    try:
-        # Run the synchronous RCON logic in a separate thread
-        server_name_result = await loop.run_in_executor(None, get_server_name_sync, addr, passwd)
-        return server_name_result
-    except Exception as e:
-        # Handle exceptions that might occur from get_server_name_sync
-        # print(f"Error in get_server_name (async wrapper): {e}") # Optional logging
-        raise Exception(f"Server is currently unavailable or RCON error (async wrapper): {e}")
-
-def get_server_status_sync(addr: str, passwd: str) -> dict:
-    """Get the server status using RCON (synchronous part), including player count."""
-    try:
-        host, port = addr.split(":")
-        port = int(port)
-        with Client(host, port, passwd=passwd) as client:
-            response = client.run("status")
-            
-            hostname_match = re.search(r"hostname:\s*(.+)", response)
-            hostname = hostname_match.group(1).strip() if hostname_match else addr
-
-            players_match = re.search(r"players\s*:\s*(\d+)\s+humans", response)
-            players = int(players_match.group(1)) if players_match else 0
-            
-            max_players_match = re.search(r"players\s*:\s*\d+\s+humans,\s*\d+\s+bots,\s*(\d+)\s+max", response)
-            max_players = int(max_players_match.group(1)) if max_players_match else 16 # Default
-
-            return {"name": hostname, "players": players, "max_players": max_players, "offline": False}
-    except Exception:
-        return {"name": addr, "players": 0, "max_players": 0, "offline": True}
-
-async def get_server_status(addr: str, passwd: str) -> dict:
-    """Get the server status using RCON, non-blocking via asyncio.to_thread."""
-    loop = asyncio.get_running_loop()
-    try:
-        server_status_result = await loop.run_in_executor(None, get_server_status_sync, addr, passwd)
-        return server_status_result
-    except Exception:
-        return {"name": addr, "players": 0, "max_players": 0, "offline": True}
+def get_all_member_objects_from_state(channel_state: dict) -> list[discord.Member]:
+    """Extract unique Discord Member objects from a channel state."""
+    members = []
+    if not channel_state:
+        return members
+    for team in channel_state.get("teams", []):
+        for player_data in team.values():
+            if player_data and not is_text_player(player_data['player']) and hasattr(player_data['player'], 'send'):
+                members.append(player_data['player'])
+    for sub_obj in channel_state.get("subs", []):
+        if sub_obj and not is_text_player(sub_obj) and hasattr(sub_obj, 'send'):
+            members.append(sub_obj)
+    unique_members = []
+    seen_ids = set()
+    for m in members:
+        if m.id not in seen_ids:
+            unique_members.append(m)
+            seen_ids.add(m.id)
+    return unique_members
 
 class MapSelect(View):
     def __init__(self, fmt: str, region_key: str, mentions: list[str], server_name: str, server_addr: str, guild_name: str, requester: discord.Member, guild: discord.Guild, subs: list[discord.Member], opponent_guild_name: str = None, challenge_data: dict = None):
@@ -287,11 +238,11 @@ class MapSelect(View):
                 # If both teams are not in the IOSCA_TEAMS table, we track the match
                 if not initiator_is_official and not opponent_is_official:
                     await add_active_match(
-                        home_team_name=self.guild_name,
-                        away_team_name=self.opponent_guild_name,
+                        team1_name=self.guild_name,
+                        team2_name=self.opponent_guild_name,
                         channel_id=interaction.channel_id
                     )
-                    print(f"[Match Tracker] Logged active non-IOSCA match: {self.guild_name} vs {self.opponent_guild_name} in channel {interaction.channel_id}")
+                    print(f"[Match Tracker] Logged active non-IOSPL match: {self.guild_name} vs {self.opponent_guild_name} in channel {interaction.channel_id}")
             except Exception as e:
                 print(f"[ERROR] Database check for active match failed: {e}")
         
@@ -306,7 +257,7 @@ class MapSelect(View):
             
         server_passwd = server_details.get("password")
         
-        cfg_name = "8v8" if self.original_fmt == "8s" else "6v6"
+        cfg_name = "8v8"
 
         try:
             loop = asyncio.get_running_loop()
@@ -585,10 +536,44 @@ async def ready_slash(ctx: ApplicationContext):
                 authoritative_game_type = active_challenge_for_this_channel.get("game_type")
                 is_initiator = False
                 opponent_state_for_challenge = state # Current channel (opponent) state
-                state_for_readiness_check = get_channel_state(active_challenge_for_this_channel.get("initiating_channel_id"))
+                
+                # Try to get initiator's state, and initialize it if it doesn't exist
+                initiator_channel_id = active_challenge_for_this_channel.get("initiating_channel_id")
+                state_for_readiness_check = get_channel_state(initiator_channel_id)
+                
                 if not state_for_readiness_check:
-                    await ctx.interaction.edit_original_response(content="❌ Critical Error: Could not retrieve initiator's state for an accepted challenge.")
-                    return
+                    # Log the error for debugging
+                    print(f"[READY CRITICAL ERROR] Could not retrieve initiator's state for challenge:")
+                    print(f"  - Challenge ID: {active_challenge_for_this_channel.get('challenge_id', 'Unknown')}")
+                    print(f"  - Initiator Channel ID: {initiator_channel_id}")
+                    print(f"  - Initiator Guild ID: {active_challenge_for_this_channel.get('initiating_guild_id', 'Unknown')}")
+                    print(f"  - Current Channel ID: {channel_id}")
+                    print(f"  - Current Guild ID: {ctx.guild_id}")
+                    
+                    # Try to initialize the initiator's state if it doesn't exist
+                    try:
+                        initiator_guild_id = active_challenge_for_this_channel.get("initiating_guild_id")
+                        if initiator_guild_id:
+                            state_for_readiness_check = await init_state(initiator_guild_id, initiator_channel_id)
+                            if not state_for_readiness_check:
+                                await ctx.interaction.edit_original_response(
+                                    content="❌ Critical Error: Could not retrieve or initialize initiator's state for an accepted challenge. "
+                                    "The challenging team may need to sign up players first."
+                                )
+                                return
+                        else:
+                            await ctx.interaction.edit_original_response(
+                                content="❌ Critical Error: Could not retrieve initiator's state for an accepted challenge. "
+                                "Challenge data is missing initiator guild ID."
+                            )
+                            return
+                    except Exception as e:
+                        print(f"[READY ERROR] Failed to initialize initiator state for challenge: {e}")
+                        await ctx.interaction.edit_original_response(
+                            content="❌ Critical Error: Could not retrieve initiator's state for an accepted challenge. "
+                            "The challenging team may need to sign up players first."
+                        )
+                        return
                 break
     
     if active_challenge_for_this_channel:
@@ -601,7 +586,7 @@ async def ready_slash(ctx: ApplicationContext):
         elif context_type in ["main_6s", "team_6s"]:
             authoritative_game_type = "6s"
         else: # Not a known channel type for matchmaking and not a challenge
-            await ctx.interaction.edit_original_response(content=f"❌ This command can only be used in a designated 8s matchmaking channel, or as part of an active challenge. This channel's current type is '{context_type}'.")
+            await ctx.interaction.edit_original_response(content=f"❌ This command can only be used in a designated 8s or 6s matchmaking channel, or as part of an active challenge. This channel's current type is '{context_type}'.")
             return
 
     # Final explicit check
@@ -636,10 +621,20 @@ async def ready_slash(ctx: ApplicationContext):
         check_initiator = actual_initiator_state_for_check if not is_initiator else state
         check_opponent = state if not is_initiator else opponent_state_for_challenge
         
+        # Additional validation and debugging
+        print(f"[READY DEBUG] Challenge readiness check:")
+        print(f"  - is_initiator: {is_initiator}")
+        print(f"  - check_initiator exists: {check_initiator is not None}")
+        print(f"  - check_opponent exists: {check_opponent is not None}")
+        print(f"  - check_initiator teams: {len(check_initiator.get('teams', [])) if check_initiator else 0}")
+        print(f"  - check_opponent teams: {len(check_opponent.get('teams', [])) if check_opponent else 0}")
+        
         if not check_initiator:
+             print(f"[READY ERROR] Initiator state missing for challenge {active_challenge_for_this_channel.get('challenge_id', 'Unknown')}")
              await ctx.interaction.edit_original_response(content="❌ Error: Initiator state data is missing for challenge readiness check.")
              return
         if not check_opponent:
+             print(f"[READY ERROR] Opponent state missing for challenge {active_challenge_for_this_channel.get('challenge_id', 'Unknown')}")
              await ctx.interaction.edit_original_response(content="❌ Error: Opponent state data is missing for challenge readiness check. They may need to use /ready or sign up players.")
              return
         are_teams_ready, readiness_message = check_match_readiness(check_initiator, check_opponent, authoritative_game_type)
@@ -666,8 +661,36 @@ async def ready_slash(ctx: ApplicationContext):
     s_opponent = None
 
     if active_challenge_for_this_channel:
-        s_initiator = get_channel_state(active_challenge_for_this_channel.get("initiating_channel_id"))
-        s_opponent = get_channel_state(active_challenge_for_this_channel.get("opponent_channel_id"))
+        initiator_channel_id = active_challenge_for_this_channel.get("initiating_channel_id")
+        opponent_channel_id = active_challenge_for_this_channel.get("opponent_channel_id")
+        
+        s_initiator = get_channel_state(initiator_channel_id)
+        s_opponent = get_channel_state(opponent_channel_id)
+        
+        # Debug logging for state retrieval
+        print(f"[READY DEBUG] Challenge {active_challenge_for_this_channel.get('challenge_id', 'Unknown')}:")
+        print(f"  - Initiator channel: {initiator_channel_id}, state exists: {s_initiator is not None}")
+        print(f"  - Opponent channel: {opponent_channel_id}, state exists: {s_opponent is not None}")
+        print(f"  - Current channel: {channel_id}, is_initiator: {is_initiator}")
+        
+        # Try to initialize missing states
+        if not s_initiator and initiator_channel_id:
+            try:
+                initiator_guild_id = active_challenge_for_this_channel.get("initiating_guild_id")
+                if initiator_guild_id:
+                    s_initiator = await init_state(initiator_guild_id, initiator_channel_id)
+                    print(f"  - Initialized initiator state: {s_initiator is not None}")
+            except Exception as e:
+                print(f"  - Failed to initialize initiator state: {e}")
+        
+        if not s_opponent and opponent_channel_id:
+            try:
+                opponent_guild_id = active_challenge_for_this_channel.get("opponent_guild_id")
+                if opponent_guild_id:
+                    s_opponent = await init_state(opponent_guild_id, opponent_channel_id)
+                    print(f"  - Initialized opponent state: {s_opponent is not None}")
+            except Exception as e:
+                print(f"  - Failed to initialize opponent state: {e}")
 
         if s_initiator and s_initiator.get("teams"):
             teams_for_player_collection.append(s_initiator["teams"][0])
@@ -775,119 +798,7 @@ async def ready_slash(ctx: ApplicationContext):
             except Exception as e:
                 print(f"[READY DEBUG] Error sending ready notification to other challenge participant: {e}")
 
-async def handle_ready_logic(interaction: discord.Interaction, guild_id: int, channel_id: int, ready_action: str):
-    # This logic is now largely bypassed by ready_slash if it goes to RegionSelect.
-    # Kept for potential future use or if direct button interactions are re-introduced.
-    # However, the primary ready check is now in ready_slash via check_match_readiness.
-    current_channel_state = get_channel_state(channel_id)
-    if not current_channel_state: 
-        current_channel_state = await init_state(guild_id, channel_id)
-        if not current_channel_state:
-            # If interaction already responded by ready_slash, this followup might fail.
-            # Consider how ready_slash ensures state before this is called.
-            try: await interaction.response.send_message("Error: Matchmaking state not found. Please use `/lineup` first.", ephemeral=True)
-            except discord.InteractionResponded: await interaction.followup.send("Error: Matchmaking state not found.", ephemeral=True)
-            return
-
-    player = interaction.user
-    state_copy = dict(current_channel_state)
-    # context_type of the current channel where button was pressed.
-    # This might be initiator's channel or opponent's (if they somehow click a stale button).
-    current_context_type = state_copy.get("context_type") 
-    ready_list = state_copy.setdefault("ready", [])
-
-    # Determine if this channel is the initiator or the opponent in an accepted challenge
-    active_challenge_data = None
-    is_initiator_channel = False
-    is_opponent_channel = False
-
-    for ch_data in active_challenges.values():
-        if ch_data.get("status") == "accepted":
-            if ch_data.get("initiating_channel_id") == channel_id:
-                active_challenge_data = ch_data
-                is_initiator_channel = True
-                break
-            elif ch_data.get("opponent_channel_id") == channel_id:
-                active_challenge_data = ch_data
-                is_opponent_channel = True
-                break
-
-    
-    # --- Player Ready/Unready Action --- 
-    is_new_interaction_response = not interaction.response.is_done()
-
-    if ready_action == "ready":
-        if is_opponent_channel and active_challenge_data:
-            msg = "This is an opponent channel in an active challenge. The initiating team manages readying up the match."
-            if is_new_interaction_response: await interaction.response.send_message(msg, ephemeral=True)
-            else: await interaction.followup.send(msg, ephemeral=True)
-            return
-        if player in ready_list:
-            msg = "You've already readied up!"
-            if is_new_interaction_response: await interaction.response.send_message(msg, ephemeral=True)
-            else: await interaction.followup.send(msg, ephemeral=True)
-            return
-        ready_list.append(player)
-        msg = f"{player.mention} is now ready!"
-        if is_new_interaction_response: await interaction.response.send_message(msg, ephemeral=True)
-        else: await interaction.followup.send(msg, ephemeral=True)
-    elif ready_action == "unready":
-        if player not in ready_list:
-            msg = "You haven't readied up yet."
-            if is_new_interaction_response: await interaction.response.send_message(msg, ephemeral=True)
-            else: await interaction.followup.send(msg, ephemeral=True)
-            return
-        ready_list.remove(player)
-        msg = f"{player.mention} is no longer ready."
-        if is_new_interaction_response: await interaction.response.send_message(msg, ephemeral=True)
-        else: await interaction.followup.send(msg, ephemeral=True)
-    
-    if is_opponent_channel:
-        if len(state_copy["teams"]) > 1:
-            state_copy["teams"][0], state_copy["teams"][1] = state_copy["teams"][1], state_copy["teams"][0]
-            swapped = True
-
-    content, embed = await format_ready_message(
-        state_copy,
-        channel_id,
-        challenge_data=active_challenge_data,
-        is_opponent_ready=opponent_full
-    )
-    if swapped:
-        state_copy["teams"][0], state_copy["teams"][1] = state_copy["teams"][1], state_copy["teams"][0]
-
-    await send_or_edit_ready_message(interaction, state_copy, content, embed)
-    if initiator_full and opponent_full and len(ready_list) >= initiator_signed_count:
-        await start_and_clear_challenge_match(interaction, active_challenge_data)
-
-    elif not active_challenge_data:
-        if not current_context_type or current_context_type == "not_matchmaking": # Should be caught by ready_slash already
-            return # Safety return
-
-        num_teams_for_match = 1 if current_context_type in ["team_6s", "team_8s"]  else 2
-        positions_to_check = SIXES_POSITIONS if current_context_type in ["main_6s", "team_6s"] else EIGHTS_POSITIONS
-        min_players_for_match_start = len(positions_to_check) * num_teams_for_match
-        
-        all_lineups_full_std = True
-        total_signed_players_std = 0
-        for i in range(num_teams_for_match):
-            if i < len(state_copy["teams"]):
-                is_full, count = await check_lineup_readiness(state_copy["teams"][i], positions_to_check, current_context_type)
-                total_signed_players_std += count
-                if not is_full: all_lineups_full_std = False
-            else:
-                all_lineups_full_std = False # Not enough team structures in state
-
-        content, embed = await format_ready_message(state_copy, channel_id)
-        await send_or_edit_ready_message(interaction, state_copy, content, embed)
-
-        if all_lineups_full_std and len(ready_list) >= total_signed_players_std and total_signed_players_std >= min_players_for_match_start:
-            await start_and_clear_standard_match(interaction, state_copy, current_context_type)
-            # No return needed here
-    else: # Is opponent channel in a challenge, or other unhandled case
-        # If it's an opponent channel, we already sent a message. If interaction wasn't responded to, respond now.
-        if not interaction.response.is_done():
-            await interaction.response.send_message("No action taken. This channel might be an opponent in an active challenge.", ephemeral=True)
+# Removed handle_ready_logic function - it was deprecated and bypassed by ready_slash
 
 async def check_lineup_readiness(team_lineup_dict: dict, positions_to_check: list, game_type: str) -> tuple[bool, int]:
     """Check if a single team's lineup is ready. Returns (is_ready, filled_count). GK is mandatory."""
@@ -936,60 +847,8 @@ async def send_or_edit_ready_message(interaction: discord.Interaction, state: di
             except discord.HTTPException as e2:
                 pass # print(f"Fallback send also failed for ready message: {e2}")
 
-async def start_and_clear_standard_match(interaction: discord.Interaction, initial_state: dict, context_type: str):
-    """Handles DMing players and state clearing for standard matchmaking.
-    The main match embed is now sent by MapSelect.on_map_selected."""
-    channel = interaction.channel
-    guild_id = channel.guild.id
-    channel_id = channel.id
-
-    # Team names for DM content (can be generic)
-    team_name_display = initial_state.get('team_name', 'Team 1') if context_type in ['team_8s', 'team_6s'] else 'Team 1'
-    opponent_display = 'CPU / Waiting for Challenge' if context_type in ['team_8s', 'team_6s'] else 'Team 2'
-    # If context_type is main_8s, team_name_display will be "Team 1" and opponent_display "Team 2"
-
-    # DM participants
-    dms_sent_ids = set() # To avoid duplicate DMs if a player is somehow in multiple lists
-    all_member_objects = []
-    for team_lineup in initial_state.get("teams", []):
-        for player_data in team_lineup.values():
-            if player_data and not is_text_player(player_data['player']) and hasattr(player_data['player'], 'send'):
-                all_member_objects.append(player_data['player'])
-    for sub_obj in initial_state.get("subs", []):
-        if sub_obj and not is_text_player(sub_obj) and hasattr(sub_obj, 'send'):
-            all_member_objects.append(sub_obj)
-    
-    unique_member_objects = list(dict.fromkeys(all_member_objects)) # Deduplicate by object reference
-
-    for member_obj in unique_member_objects:
-        if member_obj.id not in dms_sent_ids:
-            try:
-                dm_embed = discord.Embed(
-                    title="🏁 Your match is ready!",
-                    description=(
-                        f"Your match ({team_name_display} vs {opponent_display}) is now live.\n\n"
-                        f"🔗 Connect via server browser or [here](https://iosoccer.com/connect/#{YOUR_SERVER_ADDR_PLACEHOLDER}) (Password: `iosmatch`)"
-                    ),
-                    color=discord.Color.green()
-                )
-                await member_obj.send(embed=dm_embed)
-                dms_sent_ids.add(member_obj.id)
-            except Exception as e:
-                # print(f"Error sending DM to {member_obj.name}: {e}")
-                pass # Ignore DM errors
-
-    # Clear state and refresh lineup display
-    ready_message_id = initial_state.get("ready_message_id")
-    clear_channel_state(channel_id)
-    new_state = await init_state(guild_id, channel_id)
-    # Refresh lineup (will show empty)
-    await sm_refresh_lineup(channel, force_new_message=True if not new_state.get("lineup_message_id") else False)
-
-    if ready_message_id:
-        try:
-            old_msg = await channel.fetch_message(ready_message_id)
-            await old_msg.delete()
-        except: pass # Ignore if not found or other errors
+# Removed start_and_clear_standard_match function - it was orphaned dead code with placeholder values
+# The new system uses finish_standard_match_setup which correctly receives server_addr parameter
 
 async def finish_standard_match_setup(interaction: discord.Interaction, initial_state: dict, context_type: str, server_addr: str):
     """Helper to finalize standard match: DM players, clear state, refresh lineup.
@@ -1063,26 +922,6 @@ async def start_and_clear_challenge_match(
     requester_member: discord.Member
 ):
     """Handles match starting and state clearing for CHALLENGES, ensuring all parties are notified."""
-
-    # Helper to extract unique Discord.Member objects from a channel state
-    def get_all_member_objects_from_state(channel_state: dict) -> list[discord.Member]:
-        members = []
-        if not channel_state:
-            return members
-        for team in channel_state.get("teams", []):
-            for player_data in team.values():
-                if player_data and not is_text_player(player_data['player']) and hasattr(player_data['player'], 'send'):
-                    members.append(player_data['player'])
-        for sub_obj in channel_state.get("subs", []):
-            if sub_obj and not is_text_player(sub_obj) and hasattr(sub_obj, 'send'):
-                members.append(sub_obj)
-        unique_members = []
-        seen_ids = set()
-        for m in members:
-            if m.id not in seen_ids:
-                unique_members.append(m)
-                seen_ids.add(m.id)
-        return unique_members
 
     initiator_name = challenge_data["initiating_team_name"]
     opponent_name = challenge_data.get("opponent_team_name", "Opponent")
@@ -1192,7 +1031,8 @@ async def start_and_clear_challenge_match(
             opponent_team_name=opponent_name,
             game_type=challenge_data["game_type"],
             initiating_channel_mention=initiating_channel_mention,
-            embed_to_send=main_embed
+            embed_to_send=main_embed,
+            content_to_send=None
         )
     except Exception as e:
         print(f"[Challenge Start] Error in announce_match_ready: {e}")

@@ -1,3 +1,5 @@
+import asyncio
+import time
 from ios_bot.config import *
 from ios_bot.signup_manager import (
     init_state as sm_init_state, 
@@ -11,6 +13,35 @@ from ios_bot.signup_manager import (
 from ios_bot.database_manager import get_team
 from datetime import datetime, timezone
 
+# Simple rate limiting for highlights
+highlight_rate_limits = {}  # {channel_id: [timestamps]}
+
+def check_highlight_rate_limit(channel_id: int, max_requests: int = 3, time_window: float = 5.0) -> tuple[bool, float]:
+    """
+    Check if a highlight can be sent in a channel.
+    Returns (can_proceed, wait_time)
+    """
+    now = time.time()
+    
+    # Clean old timestamps
+    if channel_id in highlight_rate_limits:
+        highlight_rate_limits[channel_id] = [
+            ts for ts in highlight_rate_limits[channel_id]
+            if now - ts < time_window
+        ]
+    else:
+        highlight_rate_limits[channel_id] = []
+    
+    # Check if we can proceed
+    if len(highlight_rate_limits[channel_id]) < max_requests:
+        highlight_rate_limits[channel_id].append(now)
+        return True, 0.0
+    
+    # Calculate wait time
+    oldest_timestamp = min(highlight_rate_limits[channel_id])
+    wait_time = max(0.0, time_window - (now - oldest_timestamp))
+    return False, wait_time
+
 async def delete_after_delay(interaction, delay: int = 5):
     """Delete an interaction response after a delay"""
     await asyncio.sleep(delay)
@@ -19,16 +50,47 @@ async def delete_after_delay(interaction, delay: int = 5):
     except:
         pass
 
-def move_sub_to_position(state, position: str, team_number: int) -> Member:
-    """Move the first sub to the given position and return the sub that was moved"""
-    if not state["subs"]:
+async def move_sub_to_position(state, position: str, team_number: int, channel=None) -> Member:
+    """
+    Move the first sub to the given position and return the sub that was moved.
+    This function is async to handle race conditions when someone signs at the same time.
+    
+    Args:
+        state: The channel state dictionary
+        position: The position to fill (e.g., "GK", "LB", etc.)
+        team_number: The team number (1-indexed)
+        channel: Optional channel object for logging
+    
+    Returns:
+        The Member object that was moved, or None if no subs available
+    """
+    # Check if there are any subs available
+    if not state.get("subs") or len(state["subs"]) == 0:
+        if channel:
+            print(f"[SUB MOVE] No subs available to fill {position} on Team {team_number}")
         return None
-        
+    
+    # Get the first sub (FIFO - First In, First Out)
     sub = state["subs"].pop(0)
-    state["teams"][team_number - 1][position] = {
+    
+    # Check if the position is actually empty (race condition check)
+    current_team = state["teams"][team_number - 1]
+    if current_team.get(position) is not None:
+        # Someone signed up while we were processing, put the sub back
+        state["subs"].insert(0, sub)  # Put back at the front to maintain FIFO
+        if channel:
+            print(f"[SUB MOVE] Position {position} on Team {team_number} was already filled, returning sub to queue")
+        return None
+    
+    # Fill the position with the sub
+    current_team[position] = {
         "player": sub,
         "signup_time": datetime.now(timezone.utc)
     }
+    
+    if channel:
+        print(f"[SUB MOVE] Moved {sub.display_name} from subs to {position} on Team {team_number}")
+    
     return sub
 
 def is_player_signed(state, member: Member) -> bool:
@@ -90,7 +152,7 @@ class MoreOptionsView(View):
             )
             view_opponent.callback = self.view_opponent_lineup_callback
             self.add_item(view_opponent)
-
+    
     def _has_active_challenge(self) -> bool:
         """Check if this channel is involved in an active challenge"""
         from ios_bot.challenge_manager import active_challenges
@@ -136,7 +198,7 @@ class MoreOptionsView(View):
                         asyncio.create_task(delete_after_delay(i))
                         return
                     current_team = current_state["teams"][self.team_number - 1]
-                    moved_sub = move_sub_to_position(current_state, pos_arg, self.team_number)
+                    moved_sub = await move_sub_to_position(current_state, pos_arg, self.team_number, i.channel)
                     if moved_sub:
                         await i.followup.send(f"✅ Moved {moved_sub.mention} from subs to {pos_arg}", ephemeral=True)
                     else:
@@ -198,13 +260,32 @@ class MoreOptionsView(View):
         asyncio.create_task(delete_after_delay(interaction))
 
     async def highlight_callback(self, interaction: discord.Interaction):
-        # Check cooldown first using the unified checker
+        # Check both cooldown and rate limit
         can_send, minutes_remaining = check_notification_cooldown(interaction.channel_id)
+        can_highlight, wait_time = check_highlight_rate_limit(interaction.channel_id)
+        
+        if not can_highlight:
+            await interaction.response.send_message(f"⚠️ Please wait {wait_time:.1f} seconds before highlighting again.", ephemeral=True)
+            return
         
         if can_send:
-            await interaction.response.defer() 
-            await interaction.channel.send(content="@here", allowed_mentions=discord.AllowedMentions(everyone=True))
-            await interaction.followup.send("Highlight sent!", ephemeral=True)
+            try:
+                await interaction.response.defer()
+                
+                # Send the highlight message
+                await interaction.channel.send(content="@here", allowed_mentions=discord.AllowedMentions(everyone=True))
+                await interaction.followup.send("Highlight sent!", ephemeral=True)
+                
+            except discord.HTTPException as e:
+                if e.status == 429:  # Rate limit error
+                    await interaction.followup.send("⚠️ Rate limit reached. Please wait a moment before trying again.", ephemeral=True)
+                    print(f"[HIGHLIGHT RATE LIMIT] Channel {interaction.channel_id}: HTTP {e.status}")
+                else:
+                    await interaction.followup.send(f"❌ Error sending highlight: HTTP {e.status}", ephemeral=True)
+                    print(f"[HIGHLIGHT ERROR] HTTP {e.status}: {str(e)[:200]}...")  # Truncate long error messages
+            except Exception as e:
+                await interaction.followup.send("❌ Unexpected error sending highlight.", ephemeral=True)
+                print(f"[HIGHLIGHT ERROR] {type(e).__name__}: {str(e)[:200]}...")  # Truncate long error messages
         else:
             await interaction.response.send_message(f"❌ Please wait {minutes_remaining} minute(s).", ephemeral=True)
 
@@ -264,12 +345,12 @@ class MoreOptionsView(View):
         # Format opponent's lineup using the correct position order
         opponent_lineup = opponent_state["teams"][opponent_team_idx]
         lineup_parts = []
-        
+
         if len(opponent_lineup) == 8:
             positions = EIGHTS_POSITIONS
         else:
             positions = SIXES_POSITIONS
-        
+
         for pos in positions:
             player_data = opponent_lineup.get(pos)
             player = player_data['player'] if player_data else None
@@ -293,7 +374,7 @@ class MoreOptionsView(View):
         
         # Add game type from challenge data
         game_type = active_challenge_data.get("game_type", "8s").upper() if len(opponent_lineup) == 8 else active_challenge_data.get("game_type", "6s").upper()
-        embed.set_footer(text=f"Challenge: {game_type} • Updated in real-time")
+        embed.set_footer(text=f"Challenge: {game_type}")
         
         await interaction.followup.send(embed=embed)
 
@@ -386,7 +467,7 @@ class TeamView(View):
         await sm_refresh_lineup(interaction.channel, author_override=interaction.user)
         asyncio.create_task(delete_after_delay(interaction))
 
-    async def more_callback(self, interaction: Interaction):        
+    async def more_callback(self, interaction: Interaction):
         channel_id_to_use = interaction.channel_id or (interaction.channel.id if interaction.channel else None)
         
         view = MoreOptionsView(team_number=self.team_number, channel_id=channel_id_to_use)

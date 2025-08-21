@@ -1,6 +1,7 @@
 from ios_bot.config import *
 from ios_bot.signup_manager import init_state, is_text_player, get_player_position, refresh_lineup, TextPlayer, get_channel_context, update_state
 from .utils import delete_after_delay, move_sub_to_position
+from datetime import datetime, timezone
 
 @bot.slash_command(
     name="unsign",
@@ -84,8 +85,8 @@ async def unsign_slash(
                 moved_sub_msg = f"\n↪️ {moved_sub_display} was moved from subs to fill {signed_pos} on {original_team_name_desc}."
                 response_description += moved_sub_msg
         except Exception as e:
-            # print(f"Error during move_sub_to_position: {e}") # Optional: log error
-            pass # Continue even if move_sub fails
+            print(f"Error during move_sub_to_position: {e}")  # Log error for debugging
+            pass  # Continue even if move_sub fails
 
         unlink_embed = Embed(
             description=response_description,
@@ -112,8 +113,8 @@ async def unsign_slash(
     if action_taken:
         update_state(channel_id, state_copy)
 
-    # Refresh the lineup by editing the existing message
-    await refresh_lineup(ctx.channel, author_override=requesting_user)
+    # Refresh the lineup by sending a new message
+    await refresh_lineup(ctx.channel, force_new_message=True, author_override=requesting_user)
 
 # This is the function called by LineupView's "Unsign" button
 async def do_unsign(interaction: discord.Interaction, team_num_for_button: int = None):
@@ -147,7 +148,7 @@ async def do_unsign(interaction: discord.Interaction, team_num_for_button: int =
             await interaction.followup.send(f"✅ {player_to_unsign.display_name} removed from subs.", ephemeral=True)
             if action_taken:
                 update_state(channel_id, state_copy)
-            await refresh_lineup(interaction.channel, author_override=interaction.user)
+            await refresh_lineup(interaction.channel, force_new_message=True, author_override=interaction.user)
             return
         await interaction.followup.send(f"⚠️ {player_to_unsign.display_name}, you are not currently signed up for a position or as a sub.", ephemeral=True)
         return
@@ -170,6 +171,18 @@ async def do_unsign(interaction: discord.Interaction, team_num_for_button: int =
 
     response_description = f"❌ {interaction.user.display_name} unsigned from **{signed_pos}** on {team_name_desc}."
 
+    # Attempt to move a sub to the now empty position
+    moved_sub_msg = ""
+    try:
+        moved_sub = await move_sub_to_position(state_copy, signed_pos, signed_team_num, interaction.channel)
+        if moved_sub:
+            moved_sub_display = moved_sub.mention if hasattr(moved_sub, 'mention') else moved_sub.name
+            moved_sub_msg = f"\n↪️ {moved_sub_display} was moved from subs to fill {signed_pos} on {team_name_desc}."
+            response_description += moved_sub_msg
+    except Exception as e:
+        print(f"Error during move_sub_to_position: {e}")  # Log error for debugging
+        pass  # Continue even if move_sub fails
+
     # Create and send the public confirmation embed
     unlink_embed = Embed(
         description=response_description,
@@ -185,4 +198,4 @@ async def do_unsign(interaction: discord.Interaction, team_num_for_button: int =
     if action_taken:
         update_state(channel_id, state_copy)
 
-    await refresh_lineup(interaction.channel, author_override=interaction.user)
+    await refresh_lineup(interaction.channel, force_new_message=True, author_override=interaction.user)

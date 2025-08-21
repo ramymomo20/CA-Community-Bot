@@ -35,8 +35,13 @@ async def sub(ctx: ApplicationContext):
         await ctx.respond("⚠️ You are already signed up as a substitute.", ephemeral=True)
         return
 
+    # Add to subs list (FIFO - append to end, but we'll pop from front)
     state.setdefault("subs", []).append(player)
+    
+    # Log the sub addition for debugging
+    print(f"[SUB] {player.display_name} added to subs list. Total subs: {len(state.get('subs', []))}")
+    
     await ctx.respond(f"✅ {player.mention} has been added to the substitutes list!", ephemeral=True)
     
     # Then, refresh the public lineup which might show sub counts or lists via format_ready_message indirectly
-    await refresh_lineup(ctx.channel) 
+    await refresh_lineup(ctx.channel, force_new_message=True) 

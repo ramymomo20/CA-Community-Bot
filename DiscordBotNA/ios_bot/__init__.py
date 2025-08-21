@@ -54,13 +54,20 @@ async def on_connect():
     except Exception as e:
         print(f"Error syncing commands: {e}")
 
-
 @bot.event
 async def on_ready():
     try:
         print("================ Successful login")
         # Initialize the database (create tables if they don't exist)
         await initialize_database()
+        
+        # Initialize performance optimizations
+        from .database_manager import initialize_performance_optimizations
+        await initialize_performance_optimizations()
+
+        # Initialize weekly ratings system
+        from ios_bot.ratings.Rating_Generator.weekly_ratings import initialize_weekly_ratings
+        await initialize_weekly_ratings()
 
         await bot.change_presence(
             status=discord.Status.online, 
@@ -75,13 +82,42 @@ async def on_ready():
         setup_tasks()
         print("================ Bot fully initialized")
     except Exception as e:
+        from .error_logger import log_error
+        log_error(e, context={"event": "on_ready"}, command="bot_initialization")
         print(f"Error during bot initialization: {e}")
         
 @bot.event
 async def on_error(event, *args, **kwargs):
     """Handle errors to prevent bot crashes"""
     import traceback
-    print(f"Error in event {event}: {traceback.format_exc()}")
+    try:
+        from .error_logger import log_error
+        
+        # Get the exception info
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        
+        # Handle Discord API errors more gracefully
+        if isinstance(exc_value, discord.HTTPException):
+            if exc_value.status == 429:  # Rate limit
+                print(f"[RATE LIMIT] Discord API rate limit hit in event {event}: HTTP {exc_value.status}")
+                return  # Don't log rate limits as errors
+            else:
+                # Log other HTTP exceptions but don't crash
+                print(f"[HTTP ERROR] Discord API error in event {event}: HTTP {exc_value.status} - {exc_value}")
+                return
+        
+        # Log all other errors
+        if exc_value:
+            print(f"[GLOBAL ERROR] Unhandled error in event {event}: {exc_value}")
+            log_error(exc_value, context={
+                "event": event,
+                "args": str(args),
+                "kwargs": str(kwargs)
+            }, command="global_error_handler")
+        
+    except Exception as e:
+        print(f"[CRITICAL] Error in global error handler: {e}")
+        print(f"Original error: {exc_value if 'exc_value' in locals() else 'Unknown'}")
 
 def main():
     """Main function to start the bot"""

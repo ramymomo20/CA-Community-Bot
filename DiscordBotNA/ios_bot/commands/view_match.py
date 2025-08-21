@@ -470,7 +470,6 @@ class MatchSelect(Select):
         home_team_name = match_data['home_team']
         away_team_name = match_data['away_team']
         scoreline = match_data['scoreline'].replace('-', ' - ')
-        game_type = match_data.get('game_type', '6v6')
 
         # Get all player stats for this specific match
         match_player_stats = get_player_stats_for_match_id(selected_match_id)
@@ -510,7 +509,7 @@ class MatchSelect(Select):
         # Add lineups using the new lineup data
         if initial_lineups and final_lineups:
             # Define position order based on game type
-            position_order = ['GK', 'LB', 'RB', 'CM', 'LW', 'RW'] if game_type == '6v6' else ['GK', 'LB', 'CB', 'RB', 'CM', 'LW', 'CF', 'RW']
+            position_order = ['GK', 'LB', 'CB', 'RB', 'CM', 'LW', 'CF', 'RW']
             
             # Get lineup data for each team
             home_initial = initial_lineups.get('home', [])
@@ -527,7 +526,7 @@ class MatchSelect(Select):
             # Add substitutions field if there were any
             if substitution_summary:
                 subs_text = format_substitutions(substitution_summary, match_player_stats)
-                embed.add_field(name="🔄 SUBS", value=f"```{subs_text}```", inline=False)
+                embed.add_field(name="<:Substitute:1388489365612662887> SUBS", value=f"```{subs_text}```", inline=False)
         else:
             embed.add_field(name="Players", value="Detailed lineup data not available for this match.", inline=False)
 

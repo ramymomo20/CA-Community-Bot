@@ -104,19 +104,18 @@ class RegisterPlayersView(View):
     async def confirm_callback(self, interaction: discord.Interaction):
         # The self.selected_player_ids set is already accurately maintained
         # by the PlayerSelect.callback whenever a selection is made or changed.
-        ui_selected_ids = self.selected_player_ids # IDs selected in the current UI interaction
+        ui_selected_ids = list(self.selected_player_ids)
 
         if not ui_selected_ids:
-            await interaction.response.send_message("No new players were selected for registration.", ephemeral=True)
+            await interaction.response.edit_message(content="No players selected.", view=None)
             self.stop()
             return
         
-        # --- NEW: Player Uniqueness Validation ---
-        is_national_team = self.team_data.get("is_national_team", False)
-        team_type_str = "National Team" if is_national_team else "Club Team"
+        # Check if any players are already on teams of the same type
+        team_type_str = "National Team" if self.team_data.get('is_national_team', False) else "Club Team"
 
         for player_id in ui_selected_ids:
-            conflicting_team = await is_player_in_team_type(player_id, is_national_team)
+            conflicting_team = await is_player_in_team_type(player_id, self.team_data.get('is_national_team', False))
             if conflicting_team:
                 member = self.guild.get_member(player_id)
                 await interaction.response.edit_message(
@@ -145,7 +144,7 @@ class RegisterPlayersView(View):
                 return
 
         # Get the current state of unique players on the team
-        current_unique_player_ids_on_team = get_unique_player_ids(self.team_data)
+        current_unique_player_ids_on_team = get_unique_player_ids(self.team_data.get('players', []))
         current_player_count_on_team = len(current_unique_player_ids_on_team)
         
         # Determine which of the UI-selected players are genuinely new and eligible
@@ -188,44 +187,52 @@ class RegisterPlayersView(View):
             self.stop()
             return
 
-        # Proceed with adding players to the 'players' list in the database
-        # current_db_players_list is the list of dicts from team_data['players']
-        current_db_players_list = list(self.team_data.get('players', []))
-        
-        newly_added_to_db_list_details = [] # Store dicts {"id": id, "name": name} for DB update
-        
-        for player_id in potential_new_additions_ids: # Iterate only over genuinely new players
-            member = self.guild.get_member(player_id)
-            if member: # Should exist and not be a bot from earlier checks
-                newly_added_to_db_list_details.append({"id": member.id, "name": member.display_name})
-
-        # Construct the final list for the 'players' field in the database
-        # This explicitly adds new, unique individuals to the existing 'players' list.
-        # Duplicates within current_db_players_list would remain if they exist, but get_unique_player_ids handles overall count.
-        final_player_list_for_db = current_db_players_list + newly_added_to_db_list_details
-        
-        # Feedback on players who were selected in UI but not added (e.g. already on team)
-        already_present_selected_names = []
-        for pid in ui_selected_ids:
-            if pid in current_unique_player_ids_on_team and pid not in potential_new_additions_ids: # Was selected, on team, but not part of this "new batch"
-                member = self.guild.get_member(pid)
-                if member:
+        # Use transfer management system for adding players
+        try:
+            from ios_bot.transfer_management import add_player_to_team_with_transfer
+            
+            newly_added_names = []
+            already_present_selected_names = []
+            
+            for player_id in ui_selected_ids:
+                member = self.guild.get_member(player_id)
+                if not member:
+                    continue
+                    
+                if player_id in potential_new_additions_ids:
+                    try:
+                        await add_player_to_team_with_transfer(
+                            self.guild.id, 
+                            player_id, 
+                            member.display_name,
+                            self.author_id,
+                            self.guild.get_member(self.author_id).display_name
+                        )
+                        newly_added_names.append(member.display_name)
+                    except ValueError as e:
+                        await interaction.response.edit_message(content=f"❌ {str(e)}", view=None)
+                        self.stop()
+                        return
+                else:
                     already_present_selected_names.append(member.display_name)
         
-        if await update_team_players(self.guild.id, final_player_list_for_db):
-            newly_added_names = [p['name'] for p in newly_added_to_db_list_details]
-            response_msg = f"**Successfully registered:** {', '.join(newly_added_names)} to the team's player list.\\n"
-            if already_present_selected_names: # Feedback for players selected in UI but already on team (cap, vc, or players list)
-                response_msg += f"**Selected but already on team (not added again):** {', '.join(already_present_selected_names)}."
-            elif len(ui_selected_ids) > len(newly_added_names): # General case if some selected were not added for other reasons (e.g. bots if not pre-filtered)
-                 response_msg += " Some selected members were not added as they are already on the team or ineligible."
+            if newly_added_names:
+                response_msg = f"**Successfully registered:** {', '.join(newly_added_names)} to the team's player list.\n"
+                if already_present_selected_names:
+                    response_msg += f"**Selected but already on team (not added again):** {', '.join(already_present_selected_names)}."
+                
+                # Get updated team count
+                updated_team_data = await get_team(self.guild.id)
+                total_unique_players_after_add = len(get_unique_player_ids(updated_team_data.get('players', [])))
+                response_msg += f"\nThe team now has {total_unique_players_after_add} unique players."
 
-            total_unique_players_after_add = len(get_unique_player_ids(await get_team(self.guild.id))) # Re-fetch for current count
-            response_msg += f"\\nThe team now has {total_unique_players_after_add} unique players."
-
-            await interaction.response.edit_message(content=response_msg, view=None)
-        else:
-            await interaction.response.edit_message(content="❌ Failed to update team players in the database.", view=None)
+                await interaction.response.edit_message(content=response_msg, view=None)
+            else:
+                await interaction.response.edit_message(content="No new players were added.", view=None)
+                
+        except Exception as e:
+            await interaction.response.edit_message(content=f"❌ Error during registration: {str(e)}", view=None)
+            
         self.stop()
 
 @bot.slash_command(
@@ -258,7 +265,7 @@ async def register_players(ctx: ApplicationContext):
         return
 
     # Check 1: Team already full before starting registration, based on unique players
-    current_unique_ids = get_unique_player_ids(team_data)
+    current_unique_ids = get_unique_player_ids(team_data.get('players', []))
     if len(current_unique_ids) >= 9:
         await ctx.respond(f"Your team roster is full ({len(current_unique_ids)} unique players). No more players can be added.", ephemeral=True)
         return
@@ -301,20 +308,34 @@ async def remove_player(ctx: ApplicationContext, player: Option(Member, "Select 
         await ctx.respond("The Vice-Captain cannot be removed using this command.", ephemeral=True)
         return 
 
+    # Check if player is actually on the team
     current_players = list(team_data.get('players', []))
     player_to_remove_found = False
-    updated_players = []
-    for p_data in current_players: # Renamed p to p_data to avoid conflict if p is used elsewhere
+    for p_data in current_players:
         if isinstance(p_data, dict) and p_data.get('id') == player.id:
             player_to_remove_found = True
-        else:
-            updated_players.append(p_data)
+            break
     
     if not player_to_remove_found:
         await ctx.respond(f"{player.display_name} is not registered on this team.", ephemeral=True)
         return
 
-    if await update_team_players(guild.id, updated_players): # Await this
+    # Use transfer management system for removing players
+    try:
+        from ios_bot.transfer_management import remove_player_from_team_with_transfer
+        
+        await remove_player_from_team_with_transfer(
+            guild.id, 
+            player.id, 
+            player.display_name,
+            "Removed by team management",  # reason
+            ctx.user.id,  # processed_by_id
+            ctx.user.display_name  # processed_by_name
+        )
+        
         await ctx.respond(f"Successfully removed {player.display_name} from the team.", ephemeral=True)
-    else:
-        await ctx.respond("❌ Failed to update team players in the database when removing player.", ephemeral=True) 
+        
+    except ValueError as e:
+        await ctx.respond(f"❌ {str(e)}", ephemeral=True)
+    except Exception as e:
+        await ctx.respond(f"❌ Error removing player: {str(e)}", ephemeral=True) 

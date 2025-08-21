@@ -108,7 +108,7 @@ def load_existing_data():
             with open(match_summaries_filename, 'r', newline='', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 # Ensure match_id column exists before trying to read it
-                if 'match_id' in reader.fieldnames:
+                if reader.fieldnames and 'match_id' in reader.fieldnames:
                     for row in reader:
                         processed_match_ids.add(row['match_id'])
         except (IOError, StopIteration, KeyError) as e:
@@ -165,10 +165,10 @@ def analyze_lineups(match_data):
 
     # Determine position order based on format
     if format == 8:
-        POSITION_ORDER = ["GK", "LB", "CB", "RB", "CM", "LW", "CF", "RW"]
+        POSITION_ORDER = ["GK", "LB", "CB", "RB", "CM", "LW", "RW", "CF"]
     else:
-        POSITION_ORDER = ["GK", "LB", "RB", "CM", "LW", "RW"]
-    
+        print(f"Unknown format: {format}")
+        return {}, {}, []
 
     # Gather all periods for all players
     periods = []
@@ -412,14 +412,23 @@ def main():
             transport = paramiko.Transport((server['host'], server['port']))
             transport.connect(username=server['user'], password=server['pass'])
             sftp = paramiko.SFTPClient.from_transport(transport)
+            
+            if sftp is None:
+                print(f"Failed to create SFTP client for {server['host']}")
+                continue
+                
             sftp.chdir(server['dir'])
+            print(sftp.chdir(server['dir']))
             
             # Get all JSON files and their dates
             server_files = []
-            for filename in sftp.listdir():
-                if not filename.endswith('.json'):
-                    continue
-                
+            all_json_files = [f for f in sftp.listdir() if f.endswith('.json')]
+            print(f"  -> Found {len(all_json_files)} total JSON files on {server['host']}")
+            
+            skipped_old = 0
+            skipped_processed = 0
+            
+            for filename in all_json_files:
                 try:
                     # Extract datetime from filename
                     datetime_str = '_'.join(filename.split('_')[:2])
@@ -427,17 +436,21 @@ def main():
                     
                     # Skip files older than the last processed date
                     if last_processed_date and file_dt <= last_processed_date:
+                        skipped_old += 1
                         continue
                     
                     # Skip if match_id already processed
                     match_id = filename.replace('.json', '').replace('.', '').replace('_', '').replace('h', '').replace('m', '').replace('s', '')
                     if match_id in processed_match_ids:
+                        skipped_processed += 1
                         continue
                     
                     server_files.append((filename, file_dt))
                 except (ValueError, IndexError) as e:
-                    print(f"  -> Skipping {filename}: Could not parse datetime. Error: {e}")
+                    print(f"     ERROR: Could not parse datetime from {filename}. Error: {e}")
                     continue
+            
+            print(f"  -> Skipped {skipped_old} old files, {skipped_processed} already processed")
             
             # Sort files by date (newest first)
             server_files.sort(key=lambda x: x[1], reverse=True)
@@ -452,7 +465,7 @@ def main():
                         match_id = filename.replace('.json', '').replace('.', '').replace('_', '').replace('h', '').replace('m', '').replace('s', '')
                         new_json_files.append((match_data, file_dt, match_id, filename))
                 except Exception as e:
-                    print(f"  -> Error reading {filename}: {e}")
+                    print(f"     ERROR: Failed to read file {filename} - {e}")
                     continue
                     
         except Exception as e:
@@ -467,6 +480,12 @@ def main():
 
     # Sort all files by date (newest first)
     new_json_files.sort(key=lambda x: x[1], reverse=True)
+    
+    if new_json_files:
+        oldest_file_date = min(x[1] for x in new_json_files)
+        newest_file_date = max(x[1] for x in new_json_files)
+    else:
+        print("\nNo files will be processed.")
     
     # --- Schema Management: Build a master header ---
     master_stat_types = set()
@@ -493,8 +512,16 @@ def main():
     new_match_summaries = []
     new_player_stats = []
     latest_processed_date = last_processed_date
+    print(f"\n--- Processing {len(new_json_files)} files ---")
+    
+    processed_count = 0
+    skipped_bot_games = 0
+    skipped_wrong_format = 0
+    skipped_already_processed = 0
+    
     for data, match_dt, match_id, filename in new_json_files:
         if match_id in processed_match_ids:
+            skipped_already_processed += 1
             continue
         try:
             match_datetime_str = match_dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -508,20 +535,18 @@ def main():
                     is_bot_game = True
                     break
             if is_bot_game:
+                skipped_bot_games += 1
                 continue
             # --- End KeeperBot Check ---
 
             # --- Game Type Check ---
-            not_proper_game = False
+            is_proper_game = False
             format = data.get('matchInfo', {}).get('format')
-            if format == 6:
-                game_type = '6v6'
             if format == 8:
                 game_type = '8v8'
-            else:
-                not_proper_game = True
-                break
-            if not_proper_game:
+                is_proper_game = True
+            if not is_proper_game:
+                skipped_wrong_format += 1
                 continue
             # --- End Game Type Check ---
             
@@ -547,7 +572,6 @@ def main():
                         away_score = team['matchTotal']['statistics'][goals_index]
                 scoreline = f"{home_score}-{away_score}"
             except (IndexError, KeyError) as e:
-                print(f"  -> Skipping scoreline for {filename}: Could not find goals in statistics array. Error: {e}")
                 scoreline = "N/A"
 
             for player in data['players']:
@@ -608,6 +632,7 @@ def main():
                 'substitution_summary': json.dumps(substitution_summary)
             })
             processed_match_ids.add(match_id)
+            processed_count += 1
             
             # Update the latest processed date
             if latest_processed_date is None or match_dt > latest_processed_date:
@@ -616,6 +641,9 @@ def main():
         except (KeyError, ValueError, IndexError) as e:
             print(f"  -> Skipping match {filename} due to processing error: {e}")
             continue
+    
+    # Print processing summary
+    print(f"Processing complete:")
 
     # --- Write updates to CSV files ---
     if new_match_summaries:
@@ -649,7 +677,61 @@ def main():
         save_last_processed_date(latest_processed_date)
         print(f"Updated last processed date to: {latest_processed_date}")
     
-    print("\n--- Stats Compilation Finished ---")
+    print(f"\n--- Stats Compilation Finished ---")
+    
+    # --- Automatic Database Population ---
+    should_run_preprocessing = new_match_summaries or check_if_first_time_setup()
+    
+    if should_run_preprocessing:
+        print("\n--- Auto-populating Database from CSV ---")
+        try:
+            # Import the auto-populate function
+            from ios_bot.database_manager import auto_populate_database_from_csv
+            
+            # Create a new event loop for the auto-population
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(auto_populate_database_from_csv())
+            loop.close()
+            
+            print("✅ Database auto-population completed successfully!")
+            print("   Tournament functionality will now use fast database queries.")
+            
+        except Exception as e:
+            print(f"⚠️ Warning: Database auto-population failed: {e}")
+            print("   Tournament functionality may be slower until database is populated.")
+    else:
+        print("No new matches processed and database appears to be populated, skipping database auto-population.")
+
+
+def check_if_first_time_setup():
+    """Check if this is the first time setup by checking if database tables are empty."""
+    try:
+        # Import and check database
+        import asyncio
+        from ios_bot.database_manager import execute_query
+        
+        # Create a new event loop for the check
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Check if MATCH_STATS table has any data
+        match_result = loop.run_until_complete(execute_query("SELECT COUNT(*) as count FROM MATCH_STATS", fetchone=True))
+        team_result = loop.run_until_complete(execute_query("SELECT COUNT(*) as count FROM IOSCA_TEAMS", fetchone=True))
+        
+        loop.close()
+        
+        match_count = match_result.get('count', 0) if match_result else 0
+        team_count = team_result.get('count', 0) if team_result else 0
+        
+        print(f"Database check: Found {match_count} matches and {team_count} teams")
+        
+        # Return True if either matches or teams are empty (need to populate)
+        return match_count == 0 or team_count == 0
+        
+    except Exception as e:
+        print(f"Database check failed: {e}")
+        return True  # Assume first time if check fails
 
 if __name__ == "__main__":
     main()

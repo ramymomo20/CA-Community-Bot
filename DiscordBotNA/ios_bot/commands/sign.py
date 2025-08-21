@@ -112,7 +112,7 @@ class PositionView(View):
             
             # Send public confirmation to the channel
             await interaction.channel.send(embed=public_embed)
-            await refresh_lineup(interaction.channel, author_override=interaction.user)
+            await refresh_lineup(interaction.channel, force_new_message=True, author_override=interaction.user)
             asyncio.create_task(delete_after_delay(interaction))
 
         return position_callback
@@ -281,5 +281,5 @@ async def sign(
         f"✅ Signed {player_display_name} to **{normalized_position}** for **{team_name_for_msg}**!",
         ephemeral=True
     )
-    await refresh_lineup(ctx.channel, author_override=requesting_user) # Refresh with requesting user as author
+    await refresh_lineup(ctx.channel, force_new_message=True, author_override=requesting_user) # Refresh with requesting user as author
     asyncio.create_task(delete_after_delay(ctx.interaction))

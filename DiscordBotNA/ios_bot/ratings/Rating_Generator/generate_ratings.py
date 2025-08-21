@@ -238,7 +238,7 @@ def generate_player_ratings():
     final_output = grouped[output_columns].copy()
     
     # Save results
-    # Save in the same directory as this script (Rating Generator folder)
+    # Save in the same directory as this script (Rating_Generator folder)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output_file = os.path.join(script_dir, "final_ratings.csv")
     final_output.to_csv(output_file, index=False)
@@ -247,20 +247,20 @@ def generate_player_ratings():
     print(f"📊 Saved to: {output_file}")
     
     # Show statistics
-    print("\n📈 Rating Distribution:")
-    print(f"   Average Rating: {final_output['finalRating'].mean():.2f}")
-    print(f"   Highest Rating: {final_output['finalRating'].max():.2f}")
-    print(f"   Lowest Rating: {final_output['finalRating'].min():.2f}")
+    #print("\n📈 Rating Distribution:")
+    #print(f"   Average Rating: {final_output['finalRating'].mean():.2f}")
+    #print(f"   Highest Rating: {final_output['finalRating'].max():.2f}")
+    #print(f"   Lowest Rating: {final_output['finalRating'].min():.2f}")
     
-    print("\n🎯 By Position:")
-    for pos in sorted(final_output['position'].unique()):
-        pos_data = final_output[final_output['position'] == pos]
-        print(f"   {pos}: {len(pos_data)} players, avg {pos_data['finalRating'].mean():.2f}")
+    #print("\n🎯 By Position:")
+    # for pos in sorted(final_output['position'].unique()):
+    #     pos_data = final_output[final_output['position'] == pos]
+    #     print(f"   {pos}: {len(pos_data)} players, avg {pos_data['finalRating'].mean():.2f}")
     
-    print("\n🏆 Top 10 Players:")
-    top_players = final_output.nlargest(10, 'finalRating')[['player', 'position', 'finalRating', 'appearances']]
-    for _, player in top_players.iterrows():
-        print(f"   {player['player']} ({player['position']}) - {player['finalRating']} ({player['appearances']} apps)")
+    # print("\n🏆 Top 10 Players:")
+    # top_players = final_output.nlargest(10, 'finalRating')[['player', 'position', 'finalRating', 'appearances']]
+    # for _, player in top_players.iterrows():
+    #     print(f"   {player['player']} ({player['position']}) - {player['finalRating']} ({player['appearances']} apps)")
     
     return True
 

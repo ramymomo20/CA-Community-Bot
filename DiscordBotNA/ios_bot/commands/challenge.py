@@ -38,6 +38,38 @@ class ChallengeTargetSelect(Select):
         )
     # Callback will be handled by the view that uses this select
 
+# --- Helper function to check if a main channel is already challenged --- #
+def is_main_channel_challenged(main_channel_id: int) -> tuple[bool, str]:
+    """
+    Check if a main channel is already challenged.
+    Returns (is_challenged, challenger_name)
+    """
+    # Check active challenges
+    for ch_id, ch_data in active_challenges.items():
+        # Check if this channel is the opponent in an accepted challenge
+        if (ch_data.get("opponent_guild_id") == MAIN_GUILD_ID and 
+            ch_data.get("opponent_channel_id") == main_channel_id and 
+            ch_data.get("status") == "accepted"):
+            return True, ch_data.get("initiating_team_name", "another team")
+        
+        # Check if this channel is the target of a pending challenge
+        if (ch_data.get("target_id") == MAIN_GUILD_ID and 
+            ch_data.get("target_channel_id_for_main", 0) == main_channel_id and 
+            ch_data.get("status") == "pending_direct"):
+            return True, ch_data.get("initiating_team_name", "another team")
+    
+    return False, ""
+
+# --- Helper function to clear challenge flags from a main channel --- #
+def clear_main_channel_challenge_flags(main_channel_state: dict) -> None:
+    """
+    Clear challenge flags from a main channel state.
+    """
+    if "is_challenged_by_team_name" in main_channel_state:
+        del main_channel_state["is_challenged_by_team_name"]
+    if "active_challenge_game_type" in main_channel_state:
+        del main_channel_state["active_challenge_game_type"]
+
 class ChallengeAcceptView(View):
     """View for teams receiving a challenge, allowing them to Accept or Ignore."""
     def __init__(self, challenge_id: str, challenged_team_id: int, game_type: str):
@@ -259,7 +291,7 @@ class ChallengeView(View):
             await interaction.edit_original_response(content=f"You've selected to broadcast the {self.game_type.upper()} challenge.", view=self)
         elif chosen_type_value.startswith("main_channel_"):
             self.selected_target_type = "main_channel"
-            main_channels_ids = SIXES_MAIN_MATCHMAKING_CHANNELS if self.game_type == "6s" else EIGHTS_MAIN_MATCHMAKING_CHANNELS
+            main_channels_ids = EIGHTS_MAIN_MATCHMAKING_CHANNELS if self.game_type == "8s" else SIXES_MAIN_MATCHMAKING_CHANNELS
             if not main_channels_ids:
                 await interaction.edit_original_response(content=f"❌ Error: No main channels configured for {self.game_type.upper()}.", view=None)
                 return
@@ -275,10 +307,28 @@ class ChallengeView(View):
                 self.add_confirm_button(f"Challenge {self.selected_target_name}?")
                 await interaction.edit_original_response(content=f"You've selected to challenge: **{self.selected_target_name}**.", view=self)
             else:
+                # Remove duplicates and ensure unique channel IDs
+                unique_channel_ids = list(dict.fromkeys(main_channels_ids))  # Preserves order while removing duplicates
+                
                 options = []
-                for ch_id in main_channels_ids:
+                used_values = set()  # Track used values to prevent duplicates
+                
+                for ch_id in unique_channel_ids:
                     channel_obj = bot.get_channel(ch_id)
-                    options.append(SelectOption(label=channel_obj.name if channel_obj else f"Channel ID {ch_id}", value=str(ch_id)))
+                    channel_name = channel_obj.name if channel_obj else f"Channel ID {ch_id}"
+                    option_value = str(ch_id)
+                    
+                    # Ensure unique option values
+                    if option_value in used_values:
+                        # If duplicate value, append a suffix to make it unique
+                        counter = 1
+                        while f"{option_value}_{counter}" in used_values:
+                            counter += 1
+                        option_value = f"{option_value}_{counter}"
+                    
+                    options.append(SelectOption(label=channel_name, value=option_value))
+                    used_values.add(option_value)
+                
                 if not options:
                     await interaction.edit_original_response(content=f"❌ Error: Could not find details for configured main channels.", view=None)
                     return
@@ -291,9 +341,19 @@ class ChallengeView(View):
                 self.add_item(self.specific_main_channel_select)
                 await interaction.edit_original_response(content=f"Multiple Main {self.game_type.upper()} channels found. Please choose one:", view=self)
 
+
     async def on_specific_main_channel_selected(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        self.selected_target_id = int(interaction.data["values"][0])
+        selected_value = interaction.data["values"][0]
+        print(f"[CHALLENGE DEBUG] Selected value: {selected_value}")
+        
+        # Handle potential suffix in option values (e.g., "123456_1")
+        if "_" in selected_value:
+            # Extract the actual channel ID before the suffix
+            self.selected_target_id = int(selected_value.split("_")[0])
+        else:
+            self.selected_target_id = int(selected_value)
+            
         try:
             target_channel_obj = bot.get_channel(self.selected_target_id)
             self.selected_target_name = target_channel_obj.name if target_channel_obj else f"Main Channel ID {self.selected_target_id}"
@@ -347,10 +407,24 @@ class ChallengeView(View):
         
         initiating_team_name = initiating_team_details.get("guild_name", "Your Team")
 
-        # Check for existing outgoing challenges from this team for this game type
+        # Check for existing challenges from this team for this game type (both pending and accepted)
         for ch_id, ch_data in active_challenges.items():
-            if ch_data.get("initiating_team_id") == self.initiating_team_id and ch_data.get("game_type") == self.game_type and ch_data["status"] in ["pending_broadcast", "pending_direct"]:
-                await interaction.followup.send(f"❌ Your team already has an outgoing {self.game_type.upper()} challenge. Please `/unchallenge` first or wait for it to resolve.", ephemeral=False)
+            if (ch_data.get("initiating_team_id") == self.initiating_team_id and 
+                ch_data.get("game_type") == self.game_type and 
+                ch_data["status"] in ["pending_broadcast", "pending_direct", "accepted"]):
+                
+                status_text = "outgoing" if ch_data["status"] in ["pending_broadcast", "pending_direct"] else "active"
+                await interaction.followup.send(f"❌ Your team already has a {status_text} {self.game_type.upper()} challenge. Please `/unchallenge` first or wait for it to resolve.", ephemeral=False)
+                return
+        
+        # Check if this team is already in an accepted challenge as the opponent
+        for ch_id, ch_data in active_challenges.items():
+            if (ch_data.get("opponent_guild_id") == self.initiating_team_id and 
+                ch_data.get("game_type") == self.game_type and 
+                ch_data["status"] == "accepted"):
+                
+                opponent_team = ch_data.get("initiating_team_name", "another team")
+                await interaction.followup.send(f"❌ Your team is already in an active {self.game_type.upper()} challenge against **{opponent_team}**. Please `/unchallenge` first or wait for it to resolve.", ephemeral=False)
                 return
 
         # Initial lineup check for the initiating team (commented out for testing)
@@ -400,10 +474,15 @@ class ChallengeView(View):
             challenge_embed.set_footer(text=f"Challenge ID: {challenge_id}. Your team can accept.")
 
             for team_data in all_teams:
-                if team_data["guild_id"] == self.initiating_team_id: continue # Don't broadcast to self
+                print(f"[BROADCAST DEBUG] Processing team: {team_data.get('guild_name', 'Unknown')} (ID: {team_data.get('guild_id', 'Unknown')})")
+                
+                if team_data["guild_id"] == self.initiating_team_id:
+                    print(f"[BROADCAST DEBUG] Skipping initiating team: {team_data.get('guild_name', 'Unknown')}")
+                    continue # Don't broadcast to self
 
                 # Check if team is already in an accepted challenge
                 if any(c.get("status") == "accepted" and (c.get("initiating_team_id") == team_data["guild_id"] or c.get("opponent_guild_id") == team_data["guild_id"]) for c_id, c in active_challenges.items()):
+                    print(f"[BROADCAST DEBUG] Skipping team in active challenge: {team_data.get('guild_name', 'Unknown')}")
                     continue # Skip teams in active matches
 
                 if self.game_type == "8s":
@@ -412,7 +491,9 @@ class ChallengeView(View):
                     team_channels = team_data.get("sixes_channels", [])
                 else:
                     team_channels = []
-                
+
+                print(f"[BROADCAST DEBUG] Team {team_data.get('guild_name', 'Unknown')} has {len(team_channels)} channels")
+
                 # Send to ALL registered channels for the game type
                 if team_channels:
                     for target_ch_id in team_channels:
@@ -452,31 +533,42 @@ class ChallengeView(View):
             if not main_channel_obj:
                 await interaction.followup.send(f"Error: Could not find main {self.game_type.upper()} channel.", ephemeral=False)
                 return
-
-            # Check if main channel is already part of an accepted challenge or is the target of a pending direct one
-            main_guild_is_opponent = any(
-                c.get("opponent_guild_id") == MAIN_GUILD_ID and c.get("opponent_channel_id") == main_channel_id and c.get("status") == "accepted"
-                for c_id, c in active_challenges.items()
-            )
-            main_guild_is_target_of_pending = any(
-                c.get("target_id") == MAIN_GUILD_ID and c.get("target_channel_id_for_main", 0) == main_channel_id and c.get("status") == "pending_direct"
-                for c_id, c in active_challenges.items()
-            )
-
-            if main_guild_is_opponent or main_guild_is_target_of_pending:
-                await interaction.followup.send(f"❌ The Main Guild {self.game_type.upper()} channel ({main_channel_obj.mention}) is currently involved in another challenge. Try again later.", ephemeral=False)
-                return
-
-            # For main channel challenges, it's an auto-accept model.
-            # Update main channel state directly.
+                
+            is_challenged, challenger_name = is_main_channel_challenged(main_channel_id)
+            
+            # Also check the channel state for any lingering challenge flags
             main_channel_state = await init_state(MAIN_GUILD_ID, main_channel_id)
             if not main_channel_state:
                 await interaction.followup.send(f"Error initializing state for main channel {main_channel_obj.mention}.", ephemeral=False)
                 return
+
+            # Check if there are any lingering challenge flags in the state
+            state_challenger = main_channel_state.get("is_challenged_by_team_name")
+            if state_challenger and not is_challenged:
+                # Clear lingering flags if no active challenge exists
+                clear_main_channel_challenge_flags(main_channel_state)
+                print(f"Cleared lingering challenge flags for main channel {main_channel_id}")
             
-            # Clear main channel's second team and subs (if any) as they are now "Team Main Guild" vs challenger
+            main_channel_already_challenged = is_challenged or (state_challenger is not None)
+
+            if main_channel_already_challenged:
+                current_challenger = challenger_name if is_challenged else state_challenger
+                print(f"[CHALLENGE BLOCKED] Team {initiating_team_name} tried to challenge main channel {main_channel_id} but it's already challenged by {current_challenger}")
+                await interaction.followup.send(f"❌ The Main Guild {self.game_type.upper()} channel ({main_channel_obj.mention}) is already challenged by **{current_challenger}**. Please wait for the current challenge to resolve.", ephemeral=False)
+                return
+            
+            # For main channel challenges, it's an auto-accept model.
+            # Update main channel state directly.
+            # PRESERVE the existing lineup - just set the challenge flags
+            # The main guild's lineup (teams[0]) should remain intact
+            # Only clear the second team if it exists, as it will be replaced by the challenger
             if len(main_channel_state["teams"]) > 1:
-                main_channel_state["teams"][1] = {p: None for p in (SIXES_POSITIONS if self.game_type == "6s" else EIGHTS_POSITIONS)}
+                main_channel_state["teams"][1] = {p: None for p in (EIGHTS_POSITIONS if self.game_type == "8s" else SIXES_POSITIONS)}
+            elif len(main_channel_state["teams"]) == 1:
+                # Ensure there's a second team slot for the challenger
+                main_channel_state["teams"].append({p: None for p in (EIGHTS_POSITIONS if self.game_type == "8s" else SIXES_POSITIONS)})
+            
+            # Clear subs as they will be reassigned for the challenge
             main_channel_state["subs"].clear()
             
             # Set flags in main channel state for refresh_lineup to use
@@ -493,11 +585,12 @@ class ChallengeView(View):
             active_challenges[challenge_id] = new_challenge_data
             
             # Refresh initiator's lineup (now VS Main Guild)
-            await sm_refresh_lineup(initiating_channel_obj, author_override=interaction.user, force_new_message=True)
+            await sm_refresh_lineup(initiating_channel_obj, author_override=interaction.user, force_new_message=False)
             # Refresh main channel's lineup (now VS Initiator)
-            await sm_refresh_lineup(main_channel_obj, author_override=interaction.user, force_new_message=True)
+            await sm_refresh_lineup(main_channel_obj, author_override=interaction.user, force_new_message=False)
 
             final_followup_message = f"✅ Challenge issued to and auto-accepted by **Main Guild {self.game_type.upper()} Channel** ({main_channel_obj.mention})! Your embeds are updated."
+            print(f"[CHALLENGE SUCCESS] Team {initiating_team_name} successfully challenged main channel {main_channel_id}")
             await main_channel_obj.send(f"⚔️ Your channel has been challenged by **{initiating_team_name}** for a {self.game_type.upper()} match! Prepare your lineup!")
 
         else: # Should not be reached if selections are handled
@@ -517,12 +610,21 @@ class ChallengeView(View):
 
 @bot.slash_command(name="challenge", description="Issue a challenge to another team or the main guild.")
 async def challenge_command(ctx: ApplicationContext):
-    await ctx.defer(ephemeral=True)
-    # Get the context of the channel the command was used in
-    context = await get_channel_context(ctx.guild_id, ctx.channel_id)
-    if context.get("type") not in ["team_6s", "team_8s"]:
-        await ctx.respond("❌ This command must be used from one of your team's registered 6v6 or 8v8 matchmaking channels.", ephemeral=True)
-        return
-    game_type = "6s" if context.get("type") == "team_6s" else "8s"
-    view = ChallengeView(author_id=ctx.author.id, initiating_team_id=ctx.guild_id, initiating_channel_id=ctx.channel_id, game_type=game_type)
-    await ctx.respond(f"Starting a new {game_type.upper()} challenge... Please select the type of target:", view=view, ephemeral=True)
+    try:
+        await ctx.defer(ephemeral=True)
+        # Get the context of the channel the command was used in
+        context = await get_channel_context(ctx.guild_id, ctx.channel_id)
+        if context.get("type") not in ["team_6s", "team_8s"]:
+            await ctx.respond("❌ This command must be used from one of your team's registered 6v6 or 8v8 matchmaking channels.", ephemeral=True)
+            return
+        game_type = "6s" if context.get("type") == "team_6s" else "8s"
+        view = ChallengeView(author_id=ctx.author.id, initiating_team_id=ctx.guild_id, initiating_channel_id=ctx.channel_id, game_type=game_type)
+        await ctx.respond(f"Starting a new {game_type.upper()} challenge... Please select the type of target:", view=view, ephemeral=True)
+    except Exception as e:
+        from ios_bot.error_logger import log_error
+        log_error(e, context={
+            "guild_id": ctx.guild_id,
+            "channel_id": ctx.channel_id,
+            "context": str(context) if 'context' in locals() else "Not retrieved"
+        }, user_id=ctx.author.id, guild_id=ctx.guild_id, command="challenge")
+        await ctx.respond("❌ Error starting challenge. Please try again.", ephemeral=True)

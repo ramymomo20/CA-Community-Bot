@@ -458,7 +458,7 @@ class LeagueSelectionView(View):
         self.add_item(select)
 
     async def league_selected(self, interaction: discord.Interaction):
-        league_id = int(interaction.values[0])
+        league_id = int(interaction.data['values'][0])
         league = next(l for l in self.leagues if l['id'] == league_id)
         
         if self.action == "add_teams":
