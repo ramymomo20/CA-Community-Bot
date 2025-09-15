@@ -1,10 +1,11 @@
 from ios_bot.config import *
 from ios_bot.signup_manager import get_all_channel_ids_with_state, clear_and_refresh_channel, get_channel_state, update_state, refresh_lineup as sm_refresh_lineup
 from ios_bot.challenge_manager import active_challenges
-from ios_bot.database_manager import get_team_by_name, execute_query
+from ios_bot.database_manager import get_team_by_name, execute_query, sync_databases, is_secondary_db_available, get_all_servers_with_details
 import subprocess
 import sys
 import csv
+import asyncio
 
 # Define the target time in Eastern Time (New York)
 est_timezone = pytz.timezone('EST')
@@ -145,7 +146,7 @@ async def check_inactive_players():
                     update_state(channel_id, state_copy)
                     try:
                         # Refresh the lineup to show the change
-                        await sm_refresh_lineup(channel)
+                        await sm_refresh_lineup(channel, force_new_message=True)
                     except Exception as e:
                         print(f"Error during inactivity removal refresh in channel {channel_id}: {e}")
             except Exception as e:
@@ -198,6 +199,15 @@ async def refresh_statistics():
                         print(f"  - Team Mappings: {mapping_count['count'] if mapping_count else 0}")
                     except Exception as e:
                         print(f"⚠️ Could not get database statistics: {e}")
+                    
+                    # Generate player ratings after successful database update
+                    try:
+                        print("🌟 Generating player ratings...")
+                        from ios_bot.ratings.Rating_Generator.weekly_ratings import generate_weekly_player_ratings
+                        await generate_weekly_player_ratings()
+                    except Exception as rating_error:
+                        print(f"❌ Error during ratings generation: {rating_error}")
+                        # Don't fail the whole task if ratings fail
                 else:
                     print("❌ Fast database import failed.")
             except asyncio.TimeoutError:
@@ -360,4 +370,156 @@ def setup_tasks():
     except Exception as e:
         print(f"Error starting match announcer task: {e}")
     
-    print("Task initialization completed.") 
+    try:
+        scheduled_database_sync.start()
+        print("Scheduled database sync task started (4 AM EST daily).")
+    except Exception as e:
+        print(f"Error starting scheduled database sync task: {e}")
+    
+    try:
+        check_windows_server_status.start()
+        print("Windows server status check task started (every 5 minutes).")
+    except Exception as e:
+        print(f"Error starting Windows server status check task: {e}")
+    
+    print("Task initialization completed.")
+
+@tasks.loop(time=time(hour=4, minute=0, tzinfo=est_timezone))  # 4:00 AM EST
+async def scheduled_database_sync():
+    """Automatically sync databases at 4 AM EST every day."""
+    try:
+        print(f"[{datetime.now(est_timezone).strftime('%Y-%m-%d %H:%M:%S %Z')}] Starting scheduled database synchronization...")
+        
+        # Check if secondary database is available
+        if not is_secondary_db_available():
+            print("⚠️ Secondary database not configured. Skipping scheduled sync.")
+            return
+        
+        # Perform synchronization from primary to secondary
+        sync_result = await sync_databases(
+            source_db='primary',
+            target_db='secondary',
+            sync_structure=True,
+            sync_data=True
+        )
+        
+        if sync_result['success']:
+            duration = sync_result['end_time'] - sync_result['start_time']
+            print(f"✅ Scheduled database sync completed successfully!")
+            print(f"📊 Synced {sync_result['tables_synced']}/{sync_result['total_tables']} tables in {duration.total_seconds():.2f} seconds")
+            
+            if sync_result['errors']:
+                print(f"⚠️ {len(sync_result['errors'])} errors occurred during sync:")
+                for error in sync_result['errors'][:5]:  # Show first 5 errors
+                    print(f"  - {error}")
+        else:
+            print(f"❌ Scheduled database sync failed!")
+            if sync_result['errors']:
+                print("Errors:")
+                for error in sync_result['errors'][:5]:  # Show first 5 errors
+                    print(f"  - {error}")
+        
+    except Exception as e:
+        print(f"❌ Error during scheduled database sync: {e}")
+        # Don't re-raise - let the bot continue running
+
+@tasks.loop(minutes=5)
+async def check_windows_server_status():
+    """Check the status of all Windows servers via RCON every 5 minutes."""
+    try:
+        print(f"[{datetime.now(est_timezone).strftime('%Y-%m-%d %H:%M:%S %Z')}] Checking Windows server status...")
+        
+        # Get all servers from database
+        servers = await get_all_servers_with_details()
+        if not servers:
+            print("  - No servers found in database.")
+            return
+        
+        # Filter for Windows servers only
+        windows_servers = [server for server in servers if server.get('server_type', 'linux').lower() == 'windows']
+        
+        if not windows_servers:
+            print("  - No Windows servers found in database.")
+            return
+        
+        print(f"  - Found {len(windows_servers)} Windows server(s) to check.")
+        
+        for server in windows_servers:
+            try:
+                server_name = server.get('name', 'Unknown')
+                server_address = server.get('address', '')
+                server_password = server.get('password', '')
+                
+                if not server_address or not server_password:
+                    print(f"    - {server_name}: Missing address or password, skipping.")
+                    continue
+                
+                # Parse address (host:port)
+                if ':' not in server_address:
+                    print(f"    - {server_name}: Invalid address format '{server_address}', skipping.")
+                    continue
+                
+                host, port_str = server_address.split(':', 1)
+                try:
+                    port = int(port_str)
+                except ValueError:
+                    print(f"    - {server_name}: Invalid port '{port_str}', skipping.")
+                    continue
+                
+                # Execute RCON status command in a thread to avoid blocking
+                loop = asyncio.get_running_loop()
+                status_result = await loop.run_in_executor(
+                    None, 
+                    _rcon_status_sync,
+                    host, 
+                    port, 
+                    server_password,
+                    server_name
+                )
+                
+                if status_result:
+                    print(f"    - {server_name} ({server_address}): {status_result}")
+                else:
+                    print(f"    - {server_name} ({server_address}): Failed to get status")
+                    
+            except Exception as e:
+                print(f"    - Error checking {server.get('name', 'Unknown')}: {e}")
+        
+    except Exception as e:
+        print(f"Critical error in check_windows_server_status task: {e}")
+        # Don't re-raise - let the bot continue running
+
+def _rcon_status_sync(host: str, port: int, password: str, server_name: str) -> str:
+    """Synchronous RCON status check to be run in a thread."""
+    try:
+        from rcon.source import Client
+        with Client(host, port, passwd=password, timeout=10) as rcon_client:
+            status_response = rcon_client.run('status')
+            # Parse the response to extract useful info
+            if status_response:
+                # Extract key information from status response
+                lines = status_response.strip().split('\n')
+                server_info = []
+                
+                for line in lines[:5]:  # First few lines usually contain server info
+                    if line.strip() and not line.startswith('#'):
+                        server_info.append(line.strip())
+                
+                if server_info:
+                    return ' | '.join(server_info)
+                else:
+                    return "Server responded (no details)"
+            else:
+                return "No response from status command"
+                
+    except Exception as e:
+        return f"RCON Error: {str(e)[:100]}"  # Truncate long error messages
+
+@check_windows_server_status.before_loop
+async def before_check_windows_server_status():
+    """Ensures the bot is ready before the task loop starts."""
+    try:
+        await bot.wait_until_ready()
+        print("Windows server status check task is ready.")
+    except Exception as e:
+        print(f"Error initializing Windows server status check task: {e}") 

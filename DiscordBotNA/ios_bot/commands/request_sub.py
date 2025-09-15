@@ -34,7 +34,7 @@ def get_server_status_sync(addr: str, passwd: str) -> dict:
     try:
         host, port = addr.split(":")
         port = int(port)
-        with Client(host, port, passwd=passwd, timeout=2) as client:
+        with Client(host, port, passwd=passwd, timeout=5) as client:
             response = client.run("status")
             
             hostname_match = re.search(r"hostname:\s*(.+)", response)

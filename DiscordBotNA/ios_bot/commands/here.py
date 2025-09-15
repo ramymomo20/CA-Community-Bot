@@ -1,4 +1,4 @@
-import time
+import time as clock
 from ios_bot.config import *
 from ios_bot.signup_manager import check_notification_cooldown, get_channel_context
 
@@ -10,7 +10,7 @@ def check_here_rate_limit(channel_id: int, max_requests: int = 2, time_window: f
     Check if a /here command can be sent in a channel.
     Returns (can_proceed, wait_time)
     """
-    now = time.time()
+    now = clock.time()
     
     # Clean old timestamps
     if channel_id in here_rate_limits:

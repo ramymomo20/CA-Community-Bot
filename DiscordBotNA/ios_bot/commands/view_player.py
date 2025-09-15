@@ -64,11 +64,8 @@ class PlayerStatsView(discord.ui.View):
         
         if self.club_team_info:
             team_name = self.club_team_info.get('name') or self.club_team_info.get('guild_name', 'Unknown Team')
-            is_vice_captain = self.club_team_info.get('vice_captain_id') == self.user.id
             if is_captain:
                 role_text = " (CAPTAIN)"
-            elif is_vice_captain:
-                role_text = " (VICE CAPTAIN)"
             else:
                 role_text = ""
             embed.add_field(name="**Team**", value=f"`{team_name}`{role_text}", inline=True)
@@ -126,11 +123,16 @@ class PlayerStatsView(discord.ui.View):
             embed.add_field(name="🛡️ **Defensive**", value="\n".join(defensive_stats), inline=True)
             
             # Goalkeeper stats
+            saves = int(float(self.club_team_stats.get('keeperSaves', 0)))
+            goals_conceded = int(float(self.club_team_stats.get('goalsConceded', 0)))
+            total_shots_faced = goals_conceded + saves
+            save_rate = (saves / total_shots_faced * 100) if total_shots_faced > 0 else 0
+            
             goalkeeper_stats = [
-                f"**Saves:** `{int(float(self.club_team_stats.get('keeperSaves')))}`",
-                f"**Saves Caught:** `{int(float(self.club_team_stats.get('keeperSavesCaught')))}`",
-                f"**Goals Conceded:** `{int(float(self.club_team_stats.get('goalsConceded')))}`",
-                f"**Save Rate:** `{(int(float(self.club_team_stats.get('keeperSaves'))) / (int(float(self.club_team_stats.get('goalsConceded'))) + int(float(self.club_team_stats.get('keeperSaves'))))):.2%}`"
+                f"**Saves:** `{saves}`",
+                f"**Saves Caught:** `{int(float(self.club_team_stats.get('keeperSavesCaught', 0)))}`",
+                f"**Goals Conceded:** `{goals_conceded}`",
+                f"**Save Rate:** `{save_rate:.1f}%`"
             ]
             embed.add_field(name="🥅 **Goalkeeper**", value="\n".join(goalkeeper_stats), inline=True)
             
@@ -213,11 +215,16 @@ class PlayerStatsView(discord.ui.View):
             embed.add_field(name="🛡️ **Defensive**", value="\n".join(defensive_stats), inline=True)
             
             # Goalkeeper stats
+            saves = int(float(self.all_time_stats.get('keeperSaves', 0)))
+            goals_conceded = int(float(self.all_time_stats.get('goalsConceded', 0)))
+            total_shots_faced = goals_conceded + saves
+            save_rate = (saves / total_shots_faced * 100) if total_shots_faced > 0 else 0
+            
             goalkeeper_stats = [
-                f"**Saves:** `{int(float(self.all_time_stats.get('keeperSaves', 0)))}`",
+                f"**Saves:** `{saves}`",
                 f"**Saves Caught:** `{int(float(self.all_time_stats.get('keeperSavesCaught', 0)))}`",
-                f"**Goals Conceded:** `{int(float(self.all_time_stats.get('goalsConceded', 1)))}`",
-                f"**Save Rate:** `{(int(float(self.all_time_stats.get('keeperSaves', 0))) / (int(float(self.all_time_stats.get('goalsConceded', 0))) + int(float(self.all_time_stats.get('keeperSaves', 0))))):.2%}`"
+                f"**Goals Conceded:** `{goals_conceded}`",
+                f"**Save Rate:** `{save_rate:.1f}%`"
             ]
             embed.add_field(name="🥅 **Goalkeeper**", value="\n".join(goalkeeper_stats), inline=True)
             
@@ -255,11 +262,8 @@ class PlayerStatsView(discord.ui.View):
         
         if self.mix_team_info:
             team_name = self.mix_team_info.get('name') or self.mix_team_info.get('guild_name', 'Unknown Team')
-            is_vice_captain = self.mix_team_info.get('vice_captain_id') == self.user.id
             if is_captain:
                 role_text = " (CAPTAIN)"
-            elif is_vice_captain:
-                role_text = " (VICE CAPTAIN)"
             else:
                 role_text = ""
             embed.add_field(name="**Team**", value=f"`{team_name}`{role_text}", inline=True)
@@ -354,11 +358,8 @@ class PlayerStatsView(discord.ui.View):
         
         if self.national_team_info:
             team_name = self.national_team_info.get('name') or self.national_team_info.get('guild_name', 'Unknown Team')
-            is_vice_captain = self.national_team_info.get('vice_captain_id') == self.user.id
             if is_captain:
                 role_text = " (CAPTAIN)"
-            elif is_vice_captain:
-                role_text = " (VICE CAPTAIN)"
             else:
                 role_text = ""
             embed.add_field(name="**Team**", value=f"`{team_name}`{role_text}", inline=True)
@@ -520,12 +521,24 @@ STATS_FILE_PATH = os.path.join(os.path.dirname(__file__), '..', 'ratings', 'play
 BRONZE_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), '..', 'ratings', 'player card', 'bronze.png')
 SILVER_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), '..', 'ratings', 'player card', 'silver.png')
 GOLD_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), '..', 'ratings', 'player card', 'gold.png')
-RATINGS_FILE_PATH = os.path.join(os.path.dirname(__file__), '..', 'ratings', 'Rating Generator', 'final_ratings.csv')
+RATINGS_FILE_PATH = os.path.join(os.path.dirname(__file__), '..', 'ratings', 'Rating_Generator', 'final_ratings.csv')
 
 def get_player_rating(steam_id):
     """Get player rating from final_ratings.csv by steam_id."""
     if not os.path.exists(RATINGS_FILE_PATH):
         print(f"Ratings file not found at: {RATINGS_FILE_PATH}")
+        # Try to create the directory structure and file if they don't exist
+        try:
+            os.makedirs(os.path.dirname(RATINGS_FILE_PATH), exist_ok=True)
+            print(f"Created directory structure for ratings file")
+            
+            # Create an empty CSV file with headers
+            with open(RATINGS_FILE_PATH, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['steamid', 'finalRating'])
+            print(f"Created empty ratings file at: {RATINGS_FILE_PATH}")
+        except Exception as e:
+            print(f"Could not create ratings file: {e}")
         return None
     
     try:
@@ -944,8 +957,9 @@ async def view_player_logic(interaction: discord.Interaction, user: discord.Memb
         )
         return
 
-    club_team_info = next((team for team in player_teams if not team['is_national_team']), None)
+    club_team_info = next((team for team in player_teams if not team['is_national_team'] and not team['is_mix_team']), None)
     national_team_info = next((team for team in player_teams if team['is_national_team']), None)
+    mix_team_info = next((team for team in player_teams if team['is_mix_team']), None)
 
     # Get team-specific stats for club team
     club_team_position, club_team_stats, club_team_appearances = None, None, 0
@@ -961,6 +975,14 @@ async def view_player_logic(interaction: discord.Interaction, user: discord.Memb
         national_team_position, national_team_stats, national_team_appearances = calculate_team_specific_stats(
             player_stats_rows, 
             national_team_info['name']
+        )
+        
+    # Get team-specific stats for mix team
+    mix_team_position, mix_team_stats, mix_team_appearances = None, None, 0
+    if mix_team_info:
+        mix_team_position, mix_team_stats, mix_team_appearances = calculate_team_specific_stats(
+            player_stats_rows, 
+            mix_team_info['name']
         )
         
     # Get all-time stats
@@ -989,21 +1011,26 @@ async def view_player_logic(interaction: discord.Interaction, user: discord.Memb
         user=user,
         club_team_info=club_team_info,
         national_team_info=national_team_info,
+        mix_team_info=mix_team_info,
         club_team_position=club_team_position,
         club_team_stats=club_team_stats,
         club_team_appearances=club_team_appearances,
         national_team_position=national_team_position,
         national_team_stats=national_team_stats,
         national_team_appearances=national_team_appearances,
+        mix_team_position=mix_team_position,
+        mix_team_stats=mix_team_stats,
+        mix_team_appearances=mix_team_appearances,
         all_time_pos=all_time_pos,
         all_time_stats=all_time_stats,
         total_appearances=total_appearances,
         card_path=card_path,
-        player_rating=player_rating
+        player_rating=player_rating,
+        steam_id=steam_id
     )
     
     # Start with the first page (Club Team Stats)
-    embed = view.create_club_stats_embed()
+    embed = view.create_all_time_stats_embed()
     message = await interaction.followup.send(embed=embed, view=view)
     
     # Store the message reference in the view for timeout cleanup

@@ -3,7 +3,7 @@ from discord.ext import commands, tasks
 from discord.ui import View, Select, Button, Modal, InputText
 from discord import Option, SelectOption, Embed, ButtonStyle, ApplicationContext, Interaction, Member, TextChannel
 import random, time, asyncio, datetime, requests, re, json, csv, os, pytz
-from datetime import time, datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time
 import pandas as pd
 from rcon.source import Client
 from requests.exceptions import RequestException
@@ -71,14 +71,41 @@ token = os.getenv('DISCORD_BOT_TOKEN')
 if not token:
     raise ValueError("DISCORD_BOT_TOKEN environment variable is required but not set")
 
-# Database Info
-host = os.getenv('DB_HOST', 'db-par-01.apollopanel.com')
-port = int(os.getenv('DB_PORT', '3306'))
-user = os.getenv('DB_USER')
-password = os.getenv('DB_PASSWORD')  
-database = os.getenv('DB_NAME')
+# Primary Database Info
+host = os.getenv('DB_HOST1', 'db-par-01.apollopanel.com')
+port = int(os.getenv('DB_PORT1', '3306'))
+user = os.getenv('DB_USER1')
+password = os.getenv('DB_PASSWORD1')  
+database = os.getenv('DB_NAME1')
+
+# Secondary Database Info (Failover)
+host2 = os.getenv('DB_HOST2')
+port2 = int(os.getenv('DB_PORT2', '3306'))
+user2 = os.getenv('DB_USER2')
+password2 = os.getenv('DB_PASSWORD2')  
+database2 = os.getenv('DB_NAME2')
+
+# Database Connection Settings
 charset = 'utf8'
 collation = 'utf8_general_ci'
+
+# Track which database is currently active
+current_db_config = {
+    'primary': {
+        'host': host,
+        'port': port,
+        'user': user,
+        'password': password,
+        'database': database
+    },
+    'secondary': {
+        'host': host2,
+        'port': port2,
+        'user': user2,
+        'password': password2,
+        'database': database2
+    }
+}
 
 # Constants
 SIXES_MAIN_MATCHMAKING_CHANNELS = []

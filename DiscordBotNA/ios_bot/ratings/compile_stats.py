@@ -166,6 +166,8 @@ def analyze_lineups(match_data):
     # Determine position order based on format
     if format == 8:
         POSITION_ORDER = ["GK", "LB", "CB", "RB", "CM", "LW", "RW", "CF"]
+    elif format == 6:
+        POSITION_ORDER = ["GK", "LB", "RB", "LW", "RW"]
     else:
         print(f"Unknown format: {format}")
         return {}, {}, []
@@ -522,9 +524,11 @@ def main():
     for data, match_dt, match_id, filename in new_json_files:
         if match_id in processed_match_ids:
             skipped_already_processed += 1
+            print(f"  -> Skipped (already processed): {filename}")
             continue
         try:
             match_datetime_str = match_dt.strftime('%Y-%m-%d %H:%M:%S')
+            print(f"  -> Processing: {filename} (date: {match_dt})")
             data = data['matchData']
 
             # --- KeeperBot Check ---
@@ -544,6 +548,9 @@ def main():
             format = data.get('matchInfo', {}).get('format')
             if format == 8:
                 game_type = '8v8'
+                is_proper_game = True
+            elif format == 6:
+                game_type = '6v6'
                 is_proper_game = True
             if not is_proper_game:
                 skipped_wrong_format += 1
@@ -636,7 +643,10 @@ def main():
             
             # Update the latest processed date
             if latest_processed_date is None or match_dt > latest_processed_date:
+                print(f"     -> Updating latest processed date from {latest_processed_date} to {match_dt}")
                 latest_processed_date = match_dt
+            else:
+                print(f"     -> Date {match_dt} is not newer than current latest {latest_processed_date}")
 
         except (KeyError, ValueError, IndexError) as e:
             print(f"  -> Skipping match {filename} due to processing error: {e}")
@@ -644,6 +654,9 @@ def main():
     
     # Print processing summary
     print(f"Processing complete:")
+    print(f"  - Processed: {processed_count} matches")
+    print(f"  - Skipped: {skipped_bot_games} bot games, {skipped_wrong_format} wrong format, {skipped_already_processed} already processed")
+    print(f"  - Latest processed date after processing: {latest_processed_date}")
 
     # --- Write updates to CSV files ---
     if new_match_summaries:

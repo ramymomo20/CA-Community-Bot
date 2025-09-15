@@ -178,15 +178,7 @@ class TeamInfoView(View):
             if captain_member:
                 captain_display = captain_member.display_name
         
-        vice_captain_display = team.get('vice_captain_name', 'N/A')
-        vice_captain_id = team.get('vice_captain_id')
-        if vice_captain_id:
-            vice_captain_member = interaction.guild.get_member(vice_captain_id)
-            if vice_captain_member:
-                vice_captain_display = vice_captain_member.display_name
-        
         embed.add_field(name="👑 Captain", value=captain_display, inline=True)
-        embed.add_field(name="🎖️ Vice Captain", value=vice_captain_display, inline=True)
         embed.add_field(name="📋 Team ID", value=str(team['guild_id']), inline=True)
         
         # Add average team rating if available
@@ -198,25 +190,19 @@ class TeamInfoView(View):
         
         # Player count and channel info
         players_list = team.get('players', [])
-        total_players = len(players_list) + (1 if team.get('captain_id') else 0) + (1 if team.get('vice_captain_id') and team.get('vice_captain_id') != team.get('captain_id') else 0)
+        total_players = len(players_list) + (1 if team.get('captain_id') else 0)
         embed.add_field(name="👥 Total Players", value=str(total_players), inline=True)
 
-        # Player list with role emojis - include captain and vice captain
+        # Player list with role emojis - include captain
         player_mentions = []
         processed_players = set()  # Track processed player IDs to avoid duplicates
         
-        # First, add captain and vice captain if they're not already in the players list
+        # First, add captain if not already in the players list
         if captain_id and captain_id not in processed_players:
             captain_member = interaction.guild.get_member(captain_id)
             if captain_member:
                 player_mentions.append(f"{captain_member.display_name} 👑")
                 processed_players.add(captain_id)
-        
-        if vice_captain_id and vice_captain_id not in processed_players:
-            vice_captain_member = interaction.guild.get_member(vice_captain_id)
-            if vice_captain_member:
-                player_mentions.append(f"{vice_captain_member.display_name} 👑")
-                processed_players.add(vice_captain_id)
 
         # Then add all other players from the players list
         if players_list:

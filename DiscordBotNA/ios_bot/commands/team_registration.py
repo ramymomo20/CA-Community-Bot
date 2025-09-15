@@ -3,11 +3,10 @@ from ios_bot.database_manager import add_team, get_team, retroactively_link_team
 from ios_bot.announcements import announce_team_created
 
 class TeamTypeSelectView(View):
-    def __init__(self, author_id: int, guild: discord.Guild, vice_captain: discord.Member = None):
+    def __init__(self, author_id: int, guild: discord.Guild):
         super().__init__(timeout=200)
         self.author_id = author_id
         self.guild = guild
-        self.vice_captain = vice_captain
         self.is_national_team = None
         self.is_mix_team = None
 
@@ -53,7 +52,7 @@ class TeamTypeSelectView(View):
             return
         
         # Proceed to the next step
-        registration_view = RegistrationView(self.author_id, self.guild, self.vice_captain, self.is_national_team, self.is_mix_team)
+        registration_view = RegistrationView(self.author_id, self.guild, self.is_national_team, self.is_mix_team)
         await interaction.edit_original_response(
             content="Please provide the following details for team registration:", 
             view=registration_view
@@ -84,12 +83,10 @@ class ChannelSelect(Select):
         # We need a way to submit the whole form, perhaps a button in the view
 
 class RegistrationView(View):
-    def __init__(self, author_id: int, guild: discord.Guild, vice_captain: discord.Member = None, is_national_team: bool = False):
+    def __init__(self, author_id: int, guild: discord.Guild, is_national_team: bool = False, is_mix_team: bool = False):
         super().__init__(timeout=200) # 3 minutes timeout
         self.author_id = author_id
         self.guild = guild
-        self.vice_captain_id = vice_captain.id if vice_captain else None
-        self.vice_captain_name = vice_captain.display_name if vice_captain else None
         self.is_national_team = is_national_team
         self.is_mix_team = is_mix_team
         self.eights_channels_selected = []
@@ -126,11 +123,7 @@ class RegistrationView(View):
         guild_name = self.guild.name
         guild_icon_url = str(self.guild.icon.url) if self.guild.icon else ""
 
-        # Handle vice captain None values
-        vice_captain_id = self.vice_captain_id if self.vice_captain_id else 0
-        vice_captain_name = self.vice_captain_name if self.vice_captain_name else ""
-
-        # Only allow players who have access to at least one selected matchmaking channel and are not already captain or vice captain
+        # Only allow players who have access to at least one selected matchmaking channel
         allowed_channels = set(self.eights_channels_selected + self.sixes_channels_selected)
         selected_channels = [self.guild.get_channel(ch_id) for ch_id in allowed_channels if self.guild.get_channel(ch_id)]
         
@@ -138,10 +131,6 @@ class RegistrationView(View):
         initial_players = [
             {"id": captain_id, "name": captain_name}
         ]
-        
-        # Add vice captain if exists
-        if self.vice_captain_id:
-            initial_players.append({"id": self.vice_captain_id, "name": self.vice_captain_name})
 
         # Prevent duplicate registration
         if await get_team(guild_id):
@@ -156,8 +145,7 @@ class RegistrationView(View):
             guild_icon=guild_icon_url,
             captain_id=captain_id,
             captain_name=captain_name,
-            vice_captain_id=vice_captain_id,
-            vice_captain_name=vice_captain_name,
+            sixes_channels=self.sixes_channels_selected,
             eights_channels=self.eights_channels_selected,
             initial_players=initial_players,
             is_national_team=self.is_national_team,
@@ -169,7 +157,7 @@ class RegistrationView(View):
                 "guild_id": guild_id,
                 "guild_name": guild_name,
                 "captain_id": captain_id,
-                "vice_captain_id": vice_captain_id,
+                "sixes_channels": self.sixes_channels_selected,
                 "eights_channels": self.eights_channels_selected,
                 "initial_players": initial_players,
                 "is_national_team": self.is_national_team,
@@ -194,15 +182,7 @@ class RegistrationView(View):
                     captain_name
                 )
                 
-                # Register vice captain as player if exists
-                if self.vice_captain_id and self.vice_captain_name:
-                    await add_player_to_team_with_transfer(
-                        guild_id,
-                        self.vice_captain_id,
-                        self.vice_captain_name,
-                        captain_id,
-                        captain_name
-                    )
+
             except Exception as e:
                 print(f"⚠️ Error during player registration with transfer management: {e}")
                 # Continue with team registration even if transfer fails
@@ -217,11 +197,6 @@ class RegistrationView(View):
             embed = discord.Embed(title="✅ Team Registration Successful!", color=discord.Color.green())
             embed.description = f"**{guild_name}** has been registered as a **{team_type_str}**."
             embed.add_field(name="Captain", value=captain_name, inline=True)
-            
-            if self.vice_captain_name:
-                embed.add_field(name="Vice Captain", value=self.vice_captain_name, inline=True)
-            else:
-                embed.add_field(name="Vice Captain", value="None", inline=True)
                 
             if self.eights_channels_selected:
                 embed.add_field(name="8v8 Channels", value=", ".join([f"<#{ch_id}>" for ch_id in self.eights_channels_selected]), inline=False)
@@ -275,34 +250,18 @@ class RegistrationView(View):
     description="Register your server as an IOSCA team and set up matchmaking channels."
 )
 @commands.has_permissions(manage_guild=True)
-async def register_team(ctx, vice_captain=None):
+async def register_team(ctx):
     guild = ctx.guild
     if not guild:
         await ctx.respond("This command can only be used in a server.", ephemeral=True)
         return
-
-    # --- Validation ---
-    if vice_captain:
-        # Ensure vice_captain is a proper Discord Member object
-        if not isinstance(vice_captain, discord.Member):
-            await ctx.respond("❌ Invalid vice-captain selection. Please select a valid user from this server.", ephemeral=True)
-            return
-            
-        if ctx.author.id == vice_captain.id:
-            await ctx.respond("❌ The captain cannot also be the vice-captain. Please select a different user.", ephemeral=True)
-            return
-        
-        # Prevent bot from being vice captain
-        if vice_captain.bot:
-            await ctx.respond("❌ Bots cannot be registered as vice captains. Please select a different user.", ephemeral=True)
-            return
 
     # Check if team already registered
     if await get_team(guild.id):
         await ctx.respond(f"This server ('{guild.name}') is already registered as a team.", ephemeral=True)
         return
 
-    view = TeamTypeSelectView(ctx.author.id, guild, vice_captain)
+    view = TeamTypeSelectView(ctx.author.id, guild)
     await ctx.respond("First, what type of team are you registering?", view=view, ephemeral=True)
 
 @register_team.error
@@ -319,17 +278,7 @@ async def register_team_error(ctx: ApplicationContext, error: discord.DiscordExc
                   f"without 'Manage Server' permission.")
             
             await ctx.respond("You are missing the 'Manage Server' permission required to run this command.", ephemeral=True)
-        elif isinstance(error, AttributeError) and "'str' object has no attribute 'id'" in str(error):
-            from ios_bot.error_logger import log_error
-            log_error(error, context={
-                "command": "register_team",
-                "error_type": "AttributeError",
-                "description": "vice_captain parameter is string instead of Member object"
-            }, user_id=ctx.author.id, guild_id=ctx.guild_id, command="register_team")
-            
-            print(f"[ATTRIBUTE ERROR] User '{ctx.author.name}' (ID: {ctx.author.id}) "
-                  f"encountered an AttributeError with vice_captain parameter in /register_team")
-            await ctx.respond("❌ Error: Invalid vice-captain selection. Please select a valid user from this server.", ephemeral=True)
+
         else:
             # Log all other errors
             from ios_bot.error_logger import log_error

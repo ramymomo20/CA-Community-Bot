@@ -568,8 +568,8 @@ class ChallengeView(View):
                 # Ensure there's a second team slot for the challenger
                 main_channel_state["teams"].append({p: None for p in (EIGHTS_POSITIONS if self.game_type == "8s" else SIXES_POSITIONS)})
             
-            # Clear subs as they will be reassigned for the challenge
-            main_channel_state["subs"].clear()
+            # Preserve subs during challenge - don't clear them
+            # Subs will be isolated to their respective channels during the challenge
             
             # Set flags in main channel state for refresh_lineup to use
             main_channel_state["is_challenged_by_team_name"] = initiating_team_name
@@ -585,13 +585,16 @@ class ChallengeView(View):
             active_challenges[challenge_id] = new_challenge_data
             
             # Refresh initiator's lineup (now VS Main Guild)
-            await sm_refresh_lineup(initiating_channel_obj, author_override=interaction.user, force_new_message=False)
-            # Refresh main channel's lineup (now VS Initiator)
+            await sm_refresh_lineup(initiating_channel_obj, author_override=interaction.user, force_new_message=True)
+            
+            # Send challenge notification to main channel
+            await main_channel_obj.send(f"⚔️ Your channel has been challenged by **{initiating_team_name}** for a {self.game_type.upper()} match! Prepare your lineup!")
+            
+            # Refresh main channel's lineup (now VS Initiator) - this should happen AFTER the notification
             await sm_refresh_lineup(main_channel_obj, author_override=interaction.user, force_new_message=True)
 
             final_followup_message = f"✅ Challenge issued to and auto-accepted by **Main Guild {self.game_type.upper()} Channel** ({main_channel_obj.mention})! Your embeds are updated."
             print(f"[CHALLENGE SUCCESS] Team {initiating_team_name} successfully challenged main channel {main_channel_id}")
-            await main_channel_obj.send(f"⚔️ Your channel has been challenged by **{initiating_team_name}** for a {self.game_type.upper()} match! Prepare your lineup!")
 
         else: # Should not be reached if selections are handled
             final_followup_message = "Error: Unknown target type selected."

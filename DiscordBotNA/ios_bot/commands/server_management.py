@@ -76,6 +76,9 @@ class AddServerModal(Modal):
             except:
                 sftp_ip = f"{self.server_address.value}:8822"
 
+        # Auto-detect server type based on username
+        server_type = 'windows' if host_username and host_username.lower() == 'administrator' else 'linux'
+        
         # Add the server
         success = await add_server(
             name=self.server_name.value,
@@ -83,6 +86,7 @@ class AddServerModal(Modal):
             password=self.rcon_password.value,
             host_username=host_username,
             host_password=self.host_password.value if self.host_password.value else None,
+            server_type=server_type,
             is_active=True
         )
         
@@ -94,6 +98,7 @@ class AddServerModal(Modal):
             )
             embed.add_field(name="Server Name", value=self.server_name.value, inline=True)
             embed.add_field(name="Address", value=self.server_address.value, inline=True)
+            embed.add_field(name="Server Type", value=f"🖥️ {server_type.title()}", inline=True)
             embed.add_field(name="SFTP IP", value=sftp_ip if sftp_ip else "Not set", inline=True)
             embed.add_field(name="Host Username", value=host_username if host_username else "Not set", inline=True)
             embed.add_field(name="RCON Password", value=f"{len(self.rcon_password.value) * '*'}", inline=True)
@@ -101,11 +106,17 @@ class AddServerModal(Modal):
             # Add SFTP directory info if SFTP details are provided
             if sftp_ip and self.server_address.value:
                 try:
-                    address_parts = self.server_address.value.split(':')
-                    if len(address_parts) == 2:
-                        port = address_parts[1]
-                        sftp_dir = f"/{sftp_ip}_{port}/iosoccer/statistics"
-                        embed.add_field(name="SFTP Directory", value=sftp_dir, inline=False)
+                    if server_type == 'windows':
+                        sftp_dir = "Documents/iosoccer/iosoccer/statistics"
+                        embed.add_field(name="SFTP Directory", value=f"📁 {sftp_dir}", inline=False)
+                        embed.add_field(name="SFTP Port", value="22 (Windows SSH)", inline=True)
+                    else:
+                        address_parts = self.server_address.value.split(':')
+                        if len(address_parts) == 2:
+                            port = address_parts[1]
+                            sftp_dir = f"/{sftp_ip}_{port}/iosoccer/statistics"
+                            embed.add_field(name="SFTP Directory", value=f"📁 {sftp_dir}", inline=False)
+                            embed.add_field(name="SFTP Port", value="8822 (Linux)", inline=True)
                 except:
                     pass
             

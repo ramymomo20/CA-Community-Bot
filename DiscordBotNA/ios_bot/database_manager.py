@@ -1,4 +1,328 @@
-from ios_bot.config import * # Corrected import to use absolute path from package root and specific names
+from ios_bot.config import *
+import logging
+
+# Set up logger for database operations
+logger = logging.getLogger(__name__)
+
+# Database failover state management
+_current_db = 'primary'  # Track which database is currently active
+_failover_count = 0  # Track failover attempts
+_last_failover_time = None  # Track when last failover occurred
+_max_failover_attempts = 3  # Maximum consecutive failover attempts before giving up
+
+def get_current_db_config():
+    """Get the current database configuration (primary or secondary)."""
+    global _current_db
+    return current_db_config[_current_db]
+
+def is_secondary_db_available():
+    """Check if secondary database configuration is available."""
+    secondary_config = current_db_config['secondary']
+    return all([
+        secondary_config['host'],
+        secondary_config['user'], 
+        secondary_config['password'],
+        secondary_config['database']
+    ])
+
+def should_attempt_failover():
+    """Determine if we should attempt failover to secondary database."""
+    global _failover_count, _last_failover_time
+    
+    # Don't attempt failover if secondary DB is not configured
+    if not is_secondary_db_available():
+        return False
+        
+    # Don't attempt failover if we've exceeded max attempts
+    if _failover_count >= _max_failover_attempts:
+        return False
+        
+    # Don't attempt failover too frequently (wait at least 30 seconds)
+    import time
+    current_time = time.time()
+    if _last_failover_time and (current_time - _last_failover_time) < 30:
+        return False
+        
+    return True
+
+def perform_failover():
+    """Switch to the other database (primary <-> secondary)."""
+    global _current_db, _failover_count, _last_failover_time
+    import time
+    
+    if _current_db == 'primary':
+        if is_secondary_db_available():
+            _current_db = 'secondary'
+            _failover_count += 1
+            _last_failover_time = time.time()
+            print(f"🔄 Database failover: Switched to SECONDARY database (attempt {_failover_count})")
+            return True
+    else:
+        _current_db = 'primary'
+        _failover_count += 1
+        _last_failover_time = time.time()
+        print(f"🔄 Database failover: Switched back to PRIMARY database (attempt {_failover_count})")
+        return True
+    
+    return False
+
+def reset_failover_state():
+    """Reset failover state after successful connection."""
+    global _failover_count, _last_failover_time
+    if _failover_count > 0:
+        print(f"✅ Database connection stable. Resetting failover state.")
+        _failover_count = 0
+        _last_failover_time = None
+
+def get_db_status_info():
+    """Get current database status information."""
+    return {
+        'current_db': _current_db,
+        'failover_count': _failover_count,
+        'last_failover_time': _last_failover_time,
+        'secondary_available': is_secondary_db_available(),
+        'current_config': get_current_db_config()
+    }
+
+def _connect_to_specific_db_sync(db_type='primary'):
+    """Connect to a specific database (primary or secondary) synchronously."""
+    if db_type not in ['primary', 'secondary']:
+        raise ValueError("db_type must be 'primary' or 'secondary'")
+    
+    config = current_db_config[db_type]
+    
+    # Check if configuration is available
+    if not all([config['host'], config['user'], config['password'], config['database']]):
+        raise ValueError(f"{db_type.capitalize()} database configuration is incomplete")
+    
+    try:
+        conn = mysql.connector.connect(
+            host=config['host'],
+            port=config['port'],
+            user=config['user'],
+            password=config['password'],
+            database=config['database'],
+            connection_timeout=30,
+            auth_plugin='mysql_native_password'  # Force older auth method
+        )
+        if conn.is_connected():
+            print(f"✅ Connected to {db_type} database")
+            return conn
+    except Error as e:
+        # If auth plugin fails, try without it
+        try:
+            conn = mysql.connector.connect(
+                host=config['host'],
+                port=config['port'],
+                user=config['user'],
+                password=config['password'],
+                database=config['database'],
+                connection_timeout=30
+            )
+            if conn.is_connected():
+                print(f"✅ Connected to {db_type} database (fallback)")
+                return conn
+        except Error as e2:
+            raise Exception(f"Failed to connect to {db_type} database: {e2}")
+
+async def connect_to_specific_db(db_type='primary'):
+    """Connect to a specific database (primary or secondary) asynchronously."""
+    return await run_blocking_db_operation(_connect_to_specific_db_sync, db_type)
+
+def _get_all_table_names_sync(conn):
+    """Get all table names from a database connection."""
+    cursor = conn.cursor()
+    cursor.execute("SHOW TABLES")
+    tables = [table[0] for table in cursor.fetchall()]
+    cursor.close()
+    return tables
+
+def _sync_table_structure_sync(source_conn, target_conn, table_name):
+    """Synchronize table structure from source to target database."""
+    source_cursor = source_conn.cursor()
+    target_cursor = target_conn.cursor()
+    
+    try:
+        # Get CREATE TABLE statement from source
+        source_cursor.execute(f"SHOW CREATE TABLE `{table_name}`")
+        result = source_cursor.fetchone()
+        if not result:
+            raise Exception(f"Table {table_name} not found in source database")
+        
+        create_statement = result[1]
+        
+        # Drop table in target if it exists
+        target_cursor.execute(f"DROP TABLE IF EXISTS `{table_name}`")
+        
+        # Create table in target
+        target_cursor.execute(create_statement)
+        
+        return True
+        
+    except Exception as e:
+        raise Exception(f"Failed to sync table structure for {table_name}: {e}")
+    finally:
+        source_cursor.close()
+        target_cursor.close()
+
+def _sync_table_data_sync(source_conn, target_conn, table_name, batch_size=1000):
+    """Synchronize table data from source to target database."""
+    source_cursor = source_conn.cursor(dictionary=True)
+    target_cursor = target_conn.cursor()
+    
+    try:
+        # Get total row count
+        source_cursor.execute(f"SELECT COUNT(*) as count FROM `{table_name}`")
+        total_rows = source_cursor.fetchone()['count']
+        
+        if total_rows == 0:
+            print(f"  ℹ️ Table {table_name} is empty, skipping data sync")
+            return True
+        
+        # Clear target table
+        target_cursor.execute(f"TRUNCATE TABLE `{table_name}`")
+        
+        # Get column names
+        source_cursor.execute(f"DESCRIBE `{table_name}`")
+        columns = [col['Field'] for col in source_cursor.fetchall()]
+        column_list = ', '.join([f"`{col}`" for col in columns])
+        placeholders = ', '.join(['%s'] * len(columns))
+        
+        # Sync data in batches
+        offset = 0
+        synced_rows = 0
+        
+        while offset < total_rows:
+            # Fetch batch from source
+            source_cursor.execute(f"SELECT {column_list} FROM `{table_name}` LIMIT {batch_size} OFFSET {offset}")
+            rows = source_cursor.fetchall()
+            
+            if not rows:
+                break
+            
+            # Prepare data for insertion
+            data_to_insert = []
+            for row in rows:
+                data_to_insert.append(tuple(row[col] for col in columns))
+            
+            # Insert batch into target
+            insert_query = f"INSERT INTO `{table_name}` ({column_list}) VALUES ({placeholders})"
+            target_cursor.executemany(insert_query, data_to_insert)
+            
+            synced_rows += len(rows)
+            offset += batch_size
+            
+            # Show progress for large tables
+            if total_rows > 10000:
+                progress = (synced_rows / total_rows) * 100
+                print(f"  📊 {table_name}: {synced_rows}/{total_rows} rows ({progress:.1f}%)")
+        
+        print(f"  ✅ Synced {synced_rows} rows for table {table_name}")
+        return True
+        
+    except Exception as e:
+        raise Exception(f"Failed to sync table data for {table_name}: {e}")
+    finally:
+        source_cursor.close()
+        target_cursor.close()
+
+async def sync_databases(source_db='primary', target_db='secondary', sync_structure=True, sync_data=True):
+    """
+    Synchronize databases from source to target.
+    
+    Args:
+        source_db: Source database ('primary' or 'secondary')
+        target_db: Target database ('primary' or 'secondary') 
+        sync_structure: Whether to sync table structures
+        sync_data: Whether to sync table data
+    
+    Returns:
+        dict: Sync results with success status and details
+    """
+    if source_db == target_db:
+        raise ValueError("Source and target databases cannot be the same")
+    
+    sync_results = {
+        'success': False,
+        'source_db': source_db,
+        'target_db': target_db,
+        'tables_synced': 0,
+        'total_tables': 0,
+        'errors': [],
+        'start_time': datetime.now(),
+        'end_time': None
+    }
+    
+    source_conn = None
+    target_conn = None
+    
+    try:
+        print(f"🔄 Starting database sync: {source_db.upper()} → {target_db.upper()}")
+        
+        # Connect to both databases
+        source_conn = await connect_to_specific_db(source_db)
+        target_conn = await connect_to_specific_db(target_db)
+        
+        if not source_conn or not target_conn:
+            raise Exception("Failed to connect to one or both databases")
+        
+        # Get all tables from source database
+        tables = await run_blocking_db_operation(_get_all_table_names_sync, source_conn)
+        sync_results['total_tables'] = len(tables)
+        
+        print(f"📋 Found {len(tables)} tables to sync")
+        
+        # Sync each table
+        for table_name in tables:
+            try:
+                print(f"🔄 Syncing table: {table_name}")
+                
+                # Sync table structure
+                if sync_structure:
+                    await run_blocking_db_operation(_sync_table_structure_sync, source_conn, target_conn, table_name)
+                
+                # Sync table data
+                if sync_data:
+                    await run_blocking_db_operation(_sync_table_data_sync, source_conn, target_conn, table_name)
+                
+                sync_results['tables_synced'] += 1
+                
+            except Exception as e:
+                error_msg = f"Failed to sync table {table_name}: {str(e)}"
+                sync_results['errors'].append(error_msg)
+                print(f"❌ {error_msg}")
+                continue
+        
+        # Commit changes
+        if target_conn:
+            target_conn.commit()
+        
+        sync_results['success'] = True
+        sync_results['end_time'] = datetime.now()
+        
+        duration = sync_results['end_time'] - sync_results['start_time']
+        print(f"✅ Database sync completed in {duration.total_seconds():.2f} seconds")
+        print(f"📊 Successfully synced {sync_results['tables_synced']}/{sync_results['total_tables']} tables")
+        
+        if sync_results['errors']:
+            print(f"⚠️ {len(sync_results['errors'])} errors occurred during sync")
+        
+    except Exception as e:
+        sync_results['errors'].append(str(e))
+        sync_results['end_time'] = datetime.now()
+        print(f"❌ Database sync failed: {e}")
+        
+    finally:
+        # Close connections
+        try:
+            if source_conn and source_conn.is_connected():
+                source_conn.close()
+            if target_conn and target_conn.is_connected():
+                target_conn.close()
+        except:
+            pass
+    
+    return sync_results
 import re
 import pandas as pd
 from difflib import SequenceMatcher
@@ -8,7 +332,7 @@ import json
 import asyncio
 import mysql.connector.pooling
 from mysql.connector import Error
-import time
+import time as clock
 import logging
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -41,44 +365,47 @@ class DatabaseConnectionPool:
             self._initialize_pool()
     
     def _initialize_pool(self):
-        """Initialize the connection pool with MariaDB-compatible settings."""
+        """Initialize the connection pool with MariaDB-compatible settings and failover support."""
         try:
-            # Basic configuration compatible with MariaDB
+            # Get current database configuration
+            db_config = get_current_db_config()
+            db_name = _current_db.upper()
+            
+            # Simple configuration - same as direct connection
             pool_config = {
-                'pool_name': 'discord_bot_pool',
-                'pool_size': 10,  # Number of connections in pool
-                'pool_reset_session': True,
-                'host': host,
-                'port': port,
-                'user': user,
-                'password': password,
-                'database': database,
-                'charset': 'utf8mb4',  # Use utf8mb4 for MariaDB
-                'autocommit': True,  # Enable autocommit for better performance
+                'pool_name': f'discord_bot_pool_{_current_db}',
+                'pool_size': 10,
+                'host': db_config['host'],
+                'port': db_config['port'],
+                'user': db_config['user'],
+                'password': db_config['password'],
+                'database': db_config['database'],
                 'connection_timeout': 30,
+                'auth_plugin': 'mysql_native_password'  # Force older auth method
             }
             
-            # Add optional parameters that are supported
+            # Use the same simple approach for both databases
             try:
-                # Test if these parameters are supported
-                test_config = pool_config.copy()
-                test_config.update({
-                    'auth_plugin': 'mysql_native_password',
-                    'buffered': True,
-                    'raise_on_warnings': False,
-                })
-                
-                self._pool = mysql.connector.pooling.MySQLConnectionPool(**test_config)
-                
-            except Error as fallback_error:
-                logger.warning(f"⚠️ Full config failed ({fallback_error}), trying basic config...")
-                
-                # Fallback to basic configuration
                 self._pool = mysql.connector.pooling.MySQLConnectionPool(**pool_config)
+                print(f"✅ {db_name} database connection pool initialized")
+                reset_failover_state()
+            except Error as pool_error:
+                print(f"⚠️ {db_name} pool init failed: {pool_error}")
+                raise Error(f"Failed to initialize {db_name} connection pool: {pool_error}")
             
         except Error as e:
-            logger.error(f"❌ Failed to initialize connection pool: {e}")
-            logger.info("🔄 Falling back to single connection mode...")
+            print(f"❌ Failed to initialize {_current_db.upper()} connection pool: {e}")
+            
+            # Attempt failover if possible
+            if should_attempt_failover():
+                print(f"🔄 Attempting pool failover to {'SECONDARY' if _current_db == 'primary' else 'PRIMARY'} database...")
+                if perform_failover():
+                    # Reset pool to None and recursively try with new database
+                    self._pool = None
+                    self._initialize_pool()
+                    return
+            
+            print("🔄 Falling back to single connection mode...")
             self._pool = None
     
     def get_connection(self):
@@ -101,13 +428,13 @@ class DatabaseConnectionPool:
         if cache_key not in self._cache_timestamps:
             return False
         
-        age = time.time() - self._cache_timestamps[cache_key]
+        age = clock.time() - self._cache_timestamps[cache_key]
         return age < self._cache_ttl
     
     def _cache_result(self, cache_key: str, result: Any):
         """Cache a query result."""
         self._query_cache[cache_key] = result
-        self._cache_timestamps[cache_key] = time.time()
+        self._cache_timestamps[cache_key] = clock.time()
     
     def _get_cached_result(self, cache_key: str) -> Optional[Any]:
         """Get cached result if valid."""
@@ -117,7 +444,7 @@ class DatabaseConnectionPool:
     
     def _clear_expired_cache(self):
         """Clear expired cache entries."""
-        current_time = time.time()
+        current_time = clock.time()
         expired_keys = [
             key for key, timestamp in self._cache_timestamps.items()
             if current_time - timestamp > self._cache_ttl
@@ -141,43 +468,59 @@ async def run_blocking_db_operation(func, *args):
     return await loop.run_in_executor(None, func, *args) # None uses default ThreadPoolExecutor
 
 def _connect_db_sync(): # Renamed original connect_db
-    """Connect to the MySQL database (synchronous) with retry logic."""
+    """Connect to the MySQL database (synchronous) with retry logic and failover."""
     max_retries = 3
     retry_delay = 2
+    
+    # Try connecting with current database configuration
+    db_config = get_current_db_config()
+    db_name = _current_db.upper()
     
     for attempt in range(max_retries):
         try:
             conn = mysql.connector.connect(
-                host=host,
-                port=port,
-                user=user,
-                password=password,
-                database=database,
-                charset='utf8',
-                collation='utf8_general_ci',
-                autocommit=False,
-                connection_timeout=30,  # 30 second connection timeout
-                auth_plugin='mysql_native_password',
-                use_pure=True  # Use pure Python implementation (no pooling)
+                host=db_config['host'],
+                port=db_config['port'],
+                user=db_config['user'],
+                password=db_config['password'],
+                database=db_config['database'],
+                connection_timeout=30,
+                auth_plugin='mysql_native_password'  # Force older auth method
             )
+            
             if conn.is_connected():
-                # Only print connection success if it took multiple attempts
-                if attempt > 0:
-                    print(f"✅ Database connection successful on attempt {attempt + 1}")
+                # Reset failover state on successful connection
+                reset_failover_state()
+                
+                # Only print connection success if it took multiple attempts or after failover
+                if attempt > 0 or _failover_count > 0:
+                    print(f"✅ {db_name} database connection successful on attempt {attempt + 1}")
                 return conn
+                    
         except Error as e:
             # Only print connection details on first failure
             if attempt == 0:
-                print(f"🔗 Database connection issue (retrying):")
-                print(f"  Host: {host}")
-                print(f"  Database: {database}")
-            print(f"❌ Connection attempt {attempt + 1} failed: {e}")
+                print(f"🔗 {db_name} database connection issue (retrying):")
+                print(f"  Host: {db_config['host']}")
+                print(f"  Database: {db_config['database']}")
+            
+            print(f"❌ {db_name} connection attempt {attempt + 1} failed: {e}")
             if attempt < max_retries - 1:
                 import time
                 time.sleep(retry_delay)
                 retry_delay *= 2  # Exponential backoff
             else:
-                print(f"💥 All {max_retries} connection attempts failed")
+                print(f"💥 All {max_retries} {db_name} connection attempts failed")
+                break
+    
+    # If all retries failed, attempt failover if possible
+    if should_attempt_failover():
+        print(f"🔄 Attempting failover to {'SECONDARY' if _current_db == 'primary' else 'PRIMARY'} database...")
+        if perform_failover():
+            # Recursively try connecting with the new database
+            return _connect_db_sync()
+    
+    print(f"💀 All database connection options exhausted")
     return None
 
 async def connect_db():
@@ -1078,8 +1421,6 @@ async def initialize_database_v2():
         guild_icon VARCHAR(255),
         captain_id BIGINT NOT NULL,
         captain_name VARCHAR(255) NOT NULL,
-        vice_captain_id BIGINT,
-        vice_captain_name VARCHAR(255),
         eights_channels JSON,
         sixes_channels JSON,
                 players JSON,
@@ -1107,6 +1448,7 @@ async def initialize_database_v2():
                 sftp_ip VARCHAR(255),
                 host_username VARCHAR(255),
                 host_password VARCHAR(255),
+                server_type ENUM('linux', 'windows') DEFAULT 'linux',
                 is_active BOOLEAN NOT NULL DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -1631,7 +1973,6 @@ async def list_available_teams_for_mapping():
 
 async def add_team(guild_id: int, guild_name: str, guild_icon: str | None = None, 
              captain_id: int | None = None, captain_name: str | None = None, 
-             vice_captain_id: int | None = None, vice_captain_name: str | None = None,
              eights_channels: list | None = None,
              sixes_channels: list | None = None,
              initial_players: list | None = None,
@@ -1643,13 +1984,11 @@ async def add_team(guild_id: int, guild_name: str, guild_icon: str | None = None
     print(f"  is_national_team: {is_national_team}")
     print(f"  is_mix_team: {is_mix_team}")
     print(f"  captain_id: {captain_id}")
-    print(f"  vice_captain_id: {vice_captain_id}")
     
     query = """
     INSERT INTO IOSCA_TEAMS (guild_id, guild_name, guild_icon, captain_id, captain_name, 
-                             vice_captain_id, vice_captain_name,
                              eights_channels, sixes_channels, players, is_national_team, is_mix_team)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     # Set default values for None parameters
     if eights_channels is None:
@@ -1683,7 +2022,6 @@ async def add_team(guild_id: int, guild_name: str, guild_icon: str | None = None
             await alter_teams_table_for_mix_teams()
         
         result = await execute_query(query, (guild_id, guild_name, guild_icon, captain_id, captain_name, 
-                                      vice_captain_id, vice_captain_name, 
                                       eights_channels_json, sixes_channels_json, players_json, is_national_team, is_mix_team), commit=True)
         
         print(f"[DATABASE DEBUG] execute_query result: {result}")
@@ -1830,20 +2168,28 @@ async def get_server_by_name(name: str):
     query = "SELECT name, address, password FROM IOS_SERVERS WHERE name = %s AND is_active = TRUE"
     return await execute_query(query, (name,), fetchone=True)
 
-async def add_server(name: str, address: str, password: str, host_username: str | None = None, host_password: str | None = None, is_active: bool = True):
+async def add_server(name: str, address: str, password: str, host_username: str | None = None, host_password: str | None = None, server_type: str | None = None, is_active: bool = True):
     """Add a new server to the database."""
+    # Auto-detect server type based on username if not provided
+    if server_type is None:
+        if host_username and host_username.lower() == 'administrator':
+            server_type = 'windows'
+        else:
+            server_type = 'linux'
+    
     query = """
-    INSERT INTO IOS_SERVERS (name, address, password, host_username, host_password, is_active)
-    VALUES (%s, %s, %s, %s, %s, %s)
+    INSERT INTO IOS_SERVERS (name, address, password, host_username, host_password, server_type, is_active)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
     ON DUPLICATE KEY UPDATE
         address = VALUES(address),
         password = VALUES(password),
         host_username = VALUES(host_username),
         host_password = VALUES(host_password),
+        server_type = VALUES(server_type),
         is_active = VALUES(is_active),
         updated_at = CURRENT_TIMESTAMP
     """
-    return await execute_query(query, (name, address, password, host_username, host_password, is_active), commit=True)
+    return await execute_query(query, (name, address, password, host_username, host_password, server_type, is_active), commit=True)
 
 async def delete_server_by_id(server_id: int):
     """Delete a server by setting it as inactive (soft delete)."""
@@ -2075,8 +2421,6 @@ async def create_teams_table_if_not_exists():
         guild_icon VARCHAR(255),
         captain_id BIGINT NOT NULL,
         captain_name VARCHAR(255) NOT NULL,
-        vice_captain_id BIGINT,
-        vice_captain_name VARCHAR(255),
         eights_channels JSON,
         sixes_channels JSON,
         players JSON,
@@ -2107,6 +2451,7 @@ async def create_servers_table_if_not_exists():
         sftp_ip VARCHAR(255),
         host_username VARCHAR(255),
         host_password VARCHAR(255),
+        server_type ENUM('linux', 'windows') DEFAULT 'linux',
         is_active BOOLEAN NOT NULL DEFAULT TRUE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -3247,10 +3592,17 @@ async def get_servers_for_compile_stats():
                 address_parts = server['address'].split(':')
                 host = address_parts[0]
                 game_port = address_parts[1]
-                sftp_port = 8822  # Default SFTP port
+                sftp_port = 8822  # Default SFTP ports
                 
-                # Construct directory path as {server_address}_{game_port}/iosoccer/statistics
-                # This is the expected directory structure on the SFTP servers
+                # Check if this is a Windows server based on database server_type field
+                is_windows_server = server.get('server_type', 'linux').lower() == 'windows'
+                if is_windows_server:
+                    # Windows server with different path structure and SFTP port
+                    # Try relative path first (SFTP usually starts in user home directory)
+                    directory_path = "/C:/Users/Administrator/Documents/iosoccer/iosoccer/statistics"
+                    sftp_port = 22  # Standard SFTP port for Windows (not 8822)
+                else:
+                    # Standard Linux server path structure
                 directory_path = f"/{host}_{game_port}/iosoccer/statistics"
                 
                 formatted_servers.append({
@@ -3304,9 +3656,8 @@ async def is_player_in_team_type(discord_id: int, team_type: str) -> bool:
             if current_team_type == team_type:
                 # Check if player is captain or vice captain
                 is_captain = team.get('captain_id') == discord_id
-                is_vice_captain = team.get('vice_captain_id') == discord_id
                 
-                if is_captain or is_vice_captain:
+                if is_captain:
                     return True
                 
                 # Check if player is in the players list
@@ -3425,7 +3776,7 @@ async def get_top_team_players(guild_id: int, limit: int = 10) -> list:
 async def get_all_servers_with_details():
     """Get all servers with detailed information."""
     query = """
-    SELECT id, name, address, password, host_username, host_password, is_active, created_at, updated_at 
+    SELECT id, name, address, password, host_username, host_password, server_type, is_active, created_at, updated_at 
     FROM IOS_SERVERS 
     WHERE is_active = TRUE 
     ORDER BY name ASC
@@ -3460,7 +3811,7 @@ async def update_team_details(guild_id: int, **kwargs):
         values = []
         
         for field, value in kwargs.items():
-            if field in ['captain_id', 'captain_name', 'vice_captain_id', 'vice_captain_name', 'guild_name', 'guild_icon']:
+            if field in ['captain_id', 'captain_name', 'guild_name', 'guild_icon']:
                 update_fields.append(f"{field} = %s")
                 values.append(value)
         
@@ -3493,9 +3844,8 @@ async def get_player_teams(discord_id: int) -> list:
         for team in all_teams:
             # Check if player is captain or vice captain
             is_captain = team.get('captain_id') == discord_id
-            is_vice_captain = team.get('vice_captain_id') == discord_id
             
-            if is_captain or is_vice_captain:
+            if is_captain:
                 player_teams.append({
                     'guild_id': team['guild_id'],
                     'name': team['guild_name'],  # Use 'name' for consistency
@@ -3503,7 +3853,7 @@ async def get_player_teams(discord_id: int) -> list:
                     'is_national_team': team.get('is_national_team', False),
                     'is_mix_team': team.get('is_mix_team', False),
                     'captain_id': team.get('captain_id'),
-                    'vice_captain_id': team.get('vice_captain_id')
+
                 })
                 continue  # Don't check players list if they're captain/vice captain
             
@@ -3518,7 +3868,7 @@ async def get_player_teams(discord_id: int) -> list:
                         'is_national_team': team.get('is_national_team', False),
                         'is_mix_team': team.get('is_mix_team', False),
                         'captain_id': team.get('captain_id'),
-                        'vice_captain_id': team.get('vice_captain_id')
+    
                     })
                     break
         
@@ -4045,7 +4395,7 @@ async def cleanup_placeholder_teams():
     try:
         # Get count before cleanup - check for placeholder teams with captain_id=0 AND captain_name='Unknown'
         before_count = await execute_query(
-            "SELECT COUNT(*) as count FROM IOSCA_TEAMS WHERE captain_id = 0 AND captain_name = 'Unknown' AND vice_captain_id = 0 AND vice_captain_name = 'Unknown'", 
+            "SELECT COUNT(*) as count FROM IOSCA_TEAMS WHERE captain_id = 0 AND captain_name = 'Unknown'", 
             fetchone=True
         )
         
@@ -4057,7 +4407,7 @@ async def cleanup_placeholder_teams():
         
         # Get the guild_ids and names of placeholder teams before deletion
         placeholder_teams = await execute_query(
-            "SELECT guild_id, guild_name FROM IOSCA_TEAMS WHERE captain_id = 0 AND captain_name = 'Unknown' AND vice_captain_id = 0 AND vice_captain_name = 'Unknown'",
+            "SELECT guild_id, guild_name FROM IOSCA_TEAMS WHERE captain_id = 0 AND captain_name = 'Unknown'",
             fetchall=True
         )
         
@@ -4090,7 +4440,7 @@ async def cleanup_placeholder_teams():
         try:
             # Delete ONLY the placeholder teams from IOSCA_TEAMS 
             team_result = await execute_query(
-                "DELETE FROM IOSCA_TEAMS WHERE captain_id = 0 AND captain_name = 'Unknown' AND vice_captain_id = 0 AND vice_captain_name = 'Unknown'",
+                "DELETE FROM IOSCA_TEAMS WHERE captain_id = 0 AND captain_name = 'Unknown'",
                 commit=True
             )
         finally:
@@ -5736,14 +6086,14 @@ async def auto_link_similar_team_name(team_name: str, threshold: float = 0.7):
         import time
         if not hasattr(auto_link_similar_team_name, '_teams_cache') or \
            not hasattr(auto_link_similar_team_name, '_cache_time') or \
-           (time.time() - auto_link_similar_team_name._cache_time) > 300:  # 5 minute cache
+           (clock.time() - auto_link_similar_team_name._cache_time) > 300:  # 5 minute cache
             
             registered_teams = await execute_query(
                 "SELECT guild_id, guild_name, nicknames FROM IOSCA_TEAMS WHERE captain_id != 0",
                 fetchall=True
             )
             auto_link_similar_team_name._teams_cache = registered_teams or []
-            auto_link_similar_team_name._cache_time = time.time()
+            auto_link_similar_team_name._cache_time = clock.time()
         else:
             registered_teams = auto_link_similar_team_name._teams_cache
         

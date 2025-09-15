@@ -26,7 +26,10 @@ import time as clock
 # which can be dynamically updated by the new /edit_main_server command.
 
 # Available maps per format
-MAP_POOLS = {"8v8": ["8v8_coral","8v8_italia", "8v8_london", "8v8_vienna"]}
+MAP_POOLS = {
+    "8v8": ["8v8_coral","8v8_italia", "8v8_london", "8v8_vienna"],
+    "6v6": ["6v6_south", "6v6_peacock_park"]
+}
 
 # --- Global variable to control lineup checks for testing ---
 SKIP_LINEUP_CHECKS_FOR_TESTING = False
@@ -211,12 +214,26 @@ class MapSelect(View):
         sel.callback = self.on_map_selected
         self.add_item(sel)
 
+    def _generate_team_initials(self, team_name: str) -> str:
+        """Generate team initials based on the specified logic."""
+        # Split team name into words
+        words = team_name.strip().split()
+        
+        if len(words) == 1:
+            # Single word: take first 2 letters and capitalize
+            return words[0][:2].upper()
+        else:
+            # Multiple words: take first letter from first and second word
+            first_letter = words[0][0].upper() if words[0] else ""
+            second_letter = words[1][0].upper() if len(words) > 1 and words[1] else ""
+            return f"{first_letter}{second_letter}"
+
     def _rcon_change_map_and_exec_cfg_sync(self, server_addr_str: str, server_passwd: str, selected_map: str, cfg_name: str):
         # Synchronous RCON operations
         host, port_str = server_addr_str.split(':')
         port = int(port_str)
         with Client(host, port, passwd=server_passwd) as r:
-            r.run("map", selected_map)
+            r.run("changelevel", selected_map)
         # Consider if time.sleep is truly needed here or if RCON server handles rapid commands
         # If it's blocking, it should also be part of a to_thread call if absolutely necessary,
         # but ideally, the RCON server itself manages command processing.
@@ -224,6 +241,38 @@ class MapSelect(View):
         clock.sleep(0.5) # This sleep will also happen in the thread
         with Client(host, port, passwd=server_passwd) as r:
             r.run("exec", cfg_name)
+            r.run("sv_singlekeeper 1")
+            r.run("mp_teamkits 56 55")
+            
+            # Generate team names for mp_teamnames command
+            initiator_name = self.guild_name
+            opponent_name = self.opponent_guild_name
+            
+            # Handle special case where both teams are IOSCA
+            if initiator_name != "Team 1" and opponent_name != "Team 2":
+                # Generate initials based on the specified logic
+                initiator_initials = self._generate_team_initials(initiator_name)
+                opponent_initials = self._generate_team_initials(opponent_name)
+                initiator_full = initiator_name
+                opponent_full = opponent_name
+                teamnames_cmd = f"{initiator_initials}:{initiator_full},{opponent_initials}:{opponent_full}"
+
+            elif initiator_name == "Team 1" and opponent_name != "Team 2":
+                opponent_initials = self._generate_team_initials(opponent_name)
+                opponent_full = opponent_name
+                teamnames_cmd = f"IOSCA:IOSoccer Central America,{opponent_initials}:{opponent_full}"
+
+            elif initiator_name != "Team 1" and opponent_name == "Team 2":
+                initiator_initials = self._generate_team_initials(initiator_name)
+                initiator_full = initiator_name
+                teamnames_cmd = f"{initiator_initials}:{initiator_full},IOSCA:IOSoccer Central America"
+            else:
+                teamnames_cmd = f"IOSCA A:IOSoccer Central America A,IOSCA B:IOSoccer Central America B"
+
+            # Execute mp_teamnames command
+            r.run(f"mp_teamnames {teamnames_cmd}")
+            r.run("mp_extratime 1")
+            r.run("mp_penalties 1")
 
     async def on_map_selected(self, interaction: discord.Interaction):
         """When a map is selected, this is called."""
@@ -257,7 +306,7 @@ class MapSelect(View):
             
         server_passwd = server_details.get("password")
         
-        cfg_name = "8v8"
+        cfg_name = "8v8" if self.original_fmt == "8s" else "6v6"
 
         try:
             loop = asyncio.get_running_loop()
@@ -355,9 +404,13 @@ class MapSelect(View):
             embed.timestamp = datetime.now(timezone.utc)
             
             try:
-                await interaction.channel.send(embed=embed)
-                # self.mentions (player list) is not explicitly added here to match challenge embed style
-                # If individual player pings are needed, they could be sent as a separate message if self.mentions is populated
+                # Get all player mentions for standard match
+                all_player_mentions = get_all_member_objects_from_state(current_channel_state)
+                mention_str = " ".join(m.mention for m in all_player_mentions)
+                
+                # Send with mentions like challenge matches do
+                content_with_mentions = f"Match Starting! {mention_str}" if mention_str else "Match Starting!"
+                await interaction.channel.send(content=content_with_mentions, embed=embed)
             except discord.HTTPException as e:
                 print(f"Error sending standard match start embed: {e}")
 
@@ -407,7 +460,7 @@ class RegionSelect(View):
         rcon_servers = await get_all_servers()
 
         if not rcon_servers:
-            options.append(SelectOption(label="No servers available", value="no_servers_available", disabled=True))
+            options.append(SelectOption(label="No servers available", value="no_servers_available"))
         else:
             tasks = [get_server_status(s['address'], s['password']) for s in rcon_servers]
             results = await asyncio.gather(*tasks)
@@ -425,7 +478,7 @@ class RegionSelect(View):
                     ))
 
             if not options:
-                options.append(SelectOption(label="No servers available", value="no_servers_available", disabled=True))
+                options.append(SelectOption(label="No servers available", value="no_servers_available"))
 
         sel = Select(
             placeholder="Select a game server region…",

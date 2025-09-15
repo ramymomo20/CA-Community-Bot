@@ -15,10 +15,21 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 def check_environment():
     """Check if all required environment variables are set."""
     required_vars = [
-        'DISCORD_BOT_TOKEN',
-        'DB_USER', 
-        'DB_PASSWORD',
-        'DB_NAME'
+        'DISCORD_BOT_TOKEN'
+    ]
+    
+    # Primary database variables (required)
+    primary_db_vars = [
+        'DB_USER1', 
+        'DB_PASSWORD1',
+        'DB_NAME1'
+    ]
+    
+    # Secondary database variables (optional for failover)
+    secondary_db_vars = [
+        'DB_USER2', 
+        'DB_PASSWORD2',
+        'DB_NAME2'
     ]
     
     missing = []
@@ -26,15 +37,37 @@ def check_environment():
         if not os.getenv(var):
             missing.append(var)
     
-    if missing:
+    # Check primary database
+    primary_missing = []
+    for var in primary_db_vars:
+        if not os.getenv(var):
+            primary_missing.append(var)
+    
+    # Check secondary database
+    secondary_missing = []
+    secondary_available = True
+    for var in secondary_db_vars:
+        if not os.getenv(var):
+            secondary_missing.append(var)
+            secondary_available = False
+    
+    if missing or primary_missing:
         print("❌ Missing required environment variables:")
-        for var in missing:
+        for var in missing + primary_missing:
             print(f"   - {var}")
         print("\nPlease set these environment variables before starting the bot.")
         print("See ENVIRONMENT_SETUP.md for instructions.")
         return False
     
-    print("✅ All required environment variables are set.")
+    print("✅ Primary database configuration is set.")
+    
+    if secondary_available:
+        print("✅ Secondary database configuration is set (failover enabled).")
+    else:
+        print("⚠️ Secondary database configuration is missing (failover disabled).")
+        if secondary_missing:
+            print("   Missing secondary DB vars:", ", ".join(secondary_missing))
+    
     return True
 
 def start_bot_simple():

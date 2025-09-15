@@ -129,17 +129,11 @@ class RegisterPlayersView(View):
         # --- Explicit Validation ---
         # Although the selection UI should prevent this, we add a server-side check for robustness.
         captain_id = self.team_data.get('captain_id')
-        vice_captain_id = self.team_data.get('vice_captain_id')
         
         for player_id in ui_selected_ids:
             if player_id == captain_id:
                 member = self.guild.get_member(player_id)
                 await interaction.response.edit_message(content=f"❌ Error: The captain ({member.mention}) cannot be registered as a player.", view=None)
-                self.stop()
-                return
-            if player_id == vice_captain_id:
-                member = self.guild.get_member(player_id)
-                await interaction.response.edit_message(content=f"❌ Error: The vice-captain ({member.mention}) cannot be registered as a player.", view=None)
                 self.stop()
                 return
 
@@ -258,10 +252,9 @@ async def register_players(ctx: ApplicationContext):
         return
         
     captain_id = team_data.get('captain_id')
-    vice_captain_id = team_data.get('vice_captain_id')
     
-    if not (ctx.user.id == captain_id or ctx.user.id == vice_captain_id):
-        await ctx.respond("You must be the team Captain or Vice-Captain to register players.", ephemeral=True)
+    if not (ctx.user.id == captain_id):
+        await ctx.respond("You must be the team Captain to register players.", ephemeral=True)
         return
 
     # Check 1: Team already full before starting registration, based on unique players
@@ -296,17 +289,14 @@ async def remove_player(ctx: ApplicationContext, player: Option(Member, "Select 
 
     # Permission Check: Captain or Vice-Captain
     captain_id = team_data.get('captain_id')
-    vice_captain_id = team_data.get('vice_captain_id')
-    if not (ctx.user.id == captain_id or ctx.user.id == vice_captain_id):
+    if not (ctx.user.id == captain_id):
         await ctx.respond("You must be the team Captain or Vice-Captain to remove players.", ephemeral=True)
         return
     
     if player.id == captain_id:
         await ctx.respond("The Captain cannot be removed from the team using this command.", ephemeral=True)
         return
-    if player.id == vice_captain_id:
-        await ctx.respond("The Vice-Captain cannot be removed using this command.", ephemeral=True)
-        return 
+ 
 
     # Check if player is actually on the team
     current_players = list(team_data.get('players', []))

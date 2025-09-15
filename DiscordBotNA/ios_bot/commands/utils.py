@@ -1,5 +1,5 @@
 import asyncio
-import time
+import time as clock
 from ios_bot.config import *
 from ios_bot.signup_manager import (
     init_state as sm_init_state, 
@@ -21,7 +21,7 @@ def check_highlight_rate_limit(channel_id: int, max_requests: int = 3, time_wind
     Check if a highlight can be sent in a channel.
     Returns (can_proceed, wait_time)
     """
-    now = time.time()
+    now = clock.time()
     
     # Clean old timestamps
     if channel_id in highlight_rate_limits:
@@ -204,7 +204,7 @@ class MoreOptionsView(View):
                     else:
                         current_team[pos_arg] = None
                         await i.followup.send(f"✅ Cleared {pos_arg} position", ephemeral=True)
-                    await sm_refresh_lineup(i.channel)
+                    await sm_refresh_lineup(i.channel, force_new_message=True, author_override=i.user)
                     asyncio.create_task(delete_after_delay(i))
                 return callback
                 
@@ -229,7 +229,7 @@ class MoreOptionsView(View):
                     team[pos] = None
             state.get("subs", []).clear()
                 
-            await sm_refresh_lineup(interaction.channel)
+            await sm_refresh_lineup(interaction.channel, force_new_message=True, author_override=interaction.user)
             await interaction.followup.send("✅ Cleared all positions and subs", ephemeral=True)
         else:
             await interaction.followup.send("Error: could not get channel state to clear lineup.", ephemeral=True)
@@ -256,7 +256,7 @@ class MoreOptionsView(View):
             subs.append(interaction.user)
             await interaction.followup.send("✅ You've been added to subs", ephemeral=True)
             
-        await sm_refresh_lineup(interaction.channel, author_override=interaction.user)
+        await sm_refresh_lineup(interaction.channel, force_new_message=True, author_override=interaction.user)
         asyncio.create_task(delete_after_delay(interaction))
 
     async def highlight_callback(self, interaction: discord.Interaction):
@@ -464,7 +464,7 @@ class TeamView(View):
             subs.append(interaction.user)
             await interaction.followup.send("✅ You've been added to subs", ephemeral=True)
             
-        await sm_refresh_lineup(interaction.channel, author_override=interaction.user)
+        await sm_refresh_lineup(interaction.channel, force_new_message=True, author_override=interaction.user)
         asyncio.create_task(delete_after_delay(interaction))
 
     async def more_callback(self, interaction: Interaction):
