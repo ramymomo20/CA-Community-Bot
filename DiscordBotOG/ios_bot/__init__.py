@@ -1,0 +1,139 @@
+from ios_bot.commands import *
+# Import specific config variables needed for discovery
+from ios_bot.config import *
+from .database_manager import initialize_database
+from .tasks import setup_tasks
+
+async def discover_matchmaking_channels():
+    """Dynamically discover main matchmaking channels based on regex patterns."""
+    guild = bot.get_guild(MAIN_GUILD_ID)
+
+    if not guild:
+        print(f"Error: Main guild with ID {MAIN_GUILD_ID} not found for channel discovery.")
+        return
+
+    try:
+        sixes_regex = re.compile(SIXES_CHANNEL_REGEX_PATTERN, re.IGNORECASE)
+        eights_regex = re.compile(EIGHTS_CHANNEL_REGEX_PATTERN, re.IGNORECASE)
+    except re.error as e:
+        print(f"Error compiling regex patterns: {e}. Dynamic channel discovery will be skipped. Hardcoded/initial values will be used.")
+        return
+    
+    discovered_sixes_count = 0
+    discovered_eights_count = 0
+
+    for channel in guild.text_channels:
+        if eights_regex.search(channel.name): # Changed from .match() to .search()
+            EIGHTS_MAIN_MATCHMAKING_CHANNELS.append(channel.id)
+            discovered_eights_count += 1
+        elif sixes_regex.search(channel.name):
+            SIXES_MAIN_MATCHMAKING_CHANNELS.append(channel.id)
+            discovered_sixes_count += 1
+
+    if discovered_eights_count > 0:
+        print(f"Discovered and updated 8s Main Matchmaking Channels: {EIGHTS_MAIN_MATCHMAKING_CHANNELS}")
+    else:
+        print("No 8s Main Matchmaking Channels discovered dynamically. The list in config remains empty (or retains initial values if discovery failed before clear).")
+    if discovered_sixes_count > 0:
+        print(f"Discovered and updated 6s Main Matchmaking Channels: {SIXES_MAIN_MATCHMAKING_CHANNELS}")
+    else:
+        print("No 6s Main Matchmaking Channels discovered dynamically. The list in config remains empty (or retains initial values if discovery failed before clear).")
+
+@bot.event
+async def on_connect():
+    # Sync commands with optimal parameters for development
+    # Consider using TEST_GUILD_ID for quicker syncs during dev if commands are guild-specific
+    # For global commands, syncing without guild_ids is standard but can take time to propagate.
+    try:
+        await bot.sync_commands(
+            force=True,  # Always sync to ensure latest changes
+            register_guild_commands=True, # Ensure guild commands are registered if you use them
+            delete_existing=True  # Remove old/stale commands
+        )
+        print(f"🔄 Commands synced.") # General message, adjust if using TEST_GUILD_ID
+    except Exception as e:
+        print(f"Error syncing commands: {e}")
+
+@bot.event
+async def on_ready():
+    try:
+        print("================ Successful login")
+        # Initialize the database (create tables if they don't exist)
+        await initialize_database()
+        
+        # Initialize performance optimizations
+        from .database_manager import initialize_performance_optimizations
+        await initialize_performance_optimizations()
+
+        # Initialize weekly ratings system
+        from ios_bot.ratings.Rating_Generator.weekly_ratings import initialize_weekly_ratings
+        await initialize_weekly_ratings()
+
+        await bot.change_presence(
+            status=discord.Status.online, 
+            activity=discord.Activity(
+                type=discord.ActivityType.watching, 
+                name="Your Performances..."
+            )
+        )
+        # Discover matchmaking channels and update config lists directly
+        await discover_matchmaking_channels()
+        # Start all scheduled tasks
+        setup_tasks()
+        print("================ Bot fully initialized")
+    except Exception as e:
+        from .error_logger import log_error
+        log_error(e, context={"event": "on_ready"}, command="bot_initialization")
+        print(f"Error during bot initialization: {e}")
+        
+@bot.event
+async def on_error(event, *args, **kwargs):
+    """Handle errors to prevent bot crashes"""
+    import traceback
+    try:
+        from .error_logger import log_error
+        
+        # Get the exception info
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        
+        # Handle Discord API errors more gracefully
+        if isinstance(exc_value, discord.HTTPException):
+            if exc_value.status == 429:  # Rate limit
+                print(f"[RATE LIMIT] Discord API rate limit hit in event {event}: HTTP {exc_value.status}")
+                return  # Don't log rate limits as errors
+            else:
+                # Log other HTTP exceptions but don't crash
+                print(f"[HTTP ERROR] Discord API error in event {event}: HTTP {exc_value.status} - {exc_value}")
+                return
+        
+        # Log all other errors
+        if exc_value:
+            print(f"[GLOBAL ERROR] Unhandled error in event {event}: {exc_value}")
+            log_error(exc_value, context={
+                "event": event,
+                "args": str(args),
+                "kwargs": str(kwargs)
+            }, command="global_error_handler")
+        
+    except Exception as e:
+        print(f"[CRITICAL] Error in global error handler: {e}")
+        print(f"Original error: {exc_value if 'exc_value' in locals() else 'Unknown'}")
+
+def main():
+    """Main function to start the bot"""
+    print("Starting IOSCA Community Bot...")
+    try:
+        bot.run(token)
+    except discord.errors.LoginFailure:
+        print("ERROR: Invalid bot token. Please check your DISCORD_BOT_TOKEN environment variable.")
+        raise
+    except discord.errors.ConnectionClosed as e:
+        print(f"Discord connection closed: {e}")
+        raise
+    except Exception as e:
+        print(f"Critical error running bot: {e}")
+        raise
+
+# Only run if this file is executed directly
+if __name__ == "__main__":
+    main()
