@@ -1,5 +1,5 @@
 from ios_bot.config import *
-from ios_bot.database_manager import get_team, delete_team, get_team_by_name
+from ios_bot.signup_manager import clear_channel_state
 from ios_bot.announcements import announce_team_deleted
 
 class ConfirmDeleteView(View):
@@ -44,19 +44,19 @@ async def delete_team_command(ctx: ApplicationContext, team_name: Option(str, "A
             await ctx.respond("❌ Critical error: Main guild not found by the bot. Admin action aborted.", ephemeral=True)
             return
         
-        admin_user_member = main_guild.get_member(ctx.user.id)
+        from ios_bot.commands.utils import fetch_member_live
+        admin_user_member = await fetch_member_live(main_guild, ctx.user.id)
         if not admin_user_member:
             await ctx.respond("❌ You must be a member of the main IOSCA server to perform this admin action.", ephemeral=True)
             return
 
         admin_role = main_guild.get_role(ADMIN_ROLE_ID)
-        shaq_perm = main_guild.get_role(MY_PERM)
 
         if not admin_role:
             await ctx.respond("❌ Critical error: Admin role not found in the main guild. Admin action aborted.", ephemeral=True)
             return
 
-        if admin_role not in admin_user_member.roles and shaq_perm not in admin_user_member.roles:
+        if admin_role not in admin_user_member.roles:
             await ctx.respond("❌ You do not have the required role in the main server to delete a team by name.", ephemeral=True)
             return
         
@@ -66,7 +66,7 @@ async def delete_team_command(ctx: ApplicationContext, team_name: Option(str, "A
             await ctx.respond("❌ Admin delete requires a `team_name` to be specified.", ephemeral=True)
             return
         
-        team_to_delete_data = await get_team_by_name(team_name)
+        team_to_delete_data = await bot.db.teams.get_team_by_name(team_name)
         if not team_to_delete_data:
             await ctx.respond(f"❌ No team found with the name '{team_name}'.", ephemeral=True)
             return
@@ -79,7 +79,7 @@ async def delete_team_command(ctx: ApplicationContext, team_name: Option(str, "A
             await ctx.respond("This command must be used within the team's server to delete it, unless you are an admin specifying a team name.", ephemeral=True)
             return
         
-        team_to_delete_data = await get_team(ctx.guild.id)
+        team_to_delete_data = await bot.db.teams.get_team(ctx.guild.id)
         if not team_to_delete_data:
             await ctx.respond("This server is not registered as an IOSCA team.", ephemeral=True)
             return
@@ -89,7 +89,7 @@ async def delete_team_command(ctx: ApplicationContext, team_name: Option(str, "A
             return
         target_guild_id = ctx.guild.id
         target_guild_name = ctx.guild.name
-        leave_guild = True
+        leave_guild = False
 
     if not target_guild_id or not target_guild_name:
         await ctx.respond("Error: Could not determine team to delete.", ephemeral=True)
@@ -101,19 +101,25 @@ async def delete_team_command(ctx: ApplicationContext, team_name: Option(str, "A
     await view.wait() # Wait for the view to stop (button clicked or timeout)
 
     if view.confirmed is True:
-        if await delete_team(target_guild_id):
+        if await bot.db.teams.delete_team(target_guild_id):
+            # Clear any in-memory signup states for this team's channels
+            try:
+                if team_to_delete_data:
+                    for ch_id in (team_to_delete_data.get("eights_channels") or []):
+                        clear_channel_state(ch_id)
+                    for ch_id in (team_to_delete_data.get("sixes_channels") or []):
+                        clear_channel_state(ch_id)
+                    for ch_id in (team_to_delete_data.get("fivev5_channels") or team_to_delete_data.get("fives_channels") or []):
+                        clear_channel_state(ch_id)
+            except Exception as e:
+                print(f"Warning: failed to clear signup state for deleted team {target_guild_id}: {e}")
+
             response_message = f"✅ Team '{target_guild_name}' (ID: {target_guild_id}) has been successfully deleted from the database."
             await announce_team_deleted(
                 team_name=target_guild_name,
                 deleter_name=ctx.user.display_name,
                 guild_id=target_guild_id
             )
-            if leave_guild and ctx.guild and ctx.guild.id == target_guild_id: # Ensure bot is in the guild it needs to leave
-                try:
-                    await ctx.guild.leave()
-                    response_message += " The bot has now left this server."
-                except discord.HTTPException as e:
-                    response_message += f" Could not leave the server automatically: {e}"
             try:
                 await ctx.followup.send(response_message, ephemeral=False)
             except discord.HTTPException as e:

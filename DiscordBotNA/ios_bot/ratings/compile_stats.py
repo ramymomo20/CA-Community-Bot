@@ -1,750 +1,736 @@
+"""
+Complete compile_stats.py with full iosca_bot parser integration.
+
+Features:
+- Bot game detection (KeeperBot filtering)
+- Game type validation (6v6/8v8 only)
+- Substitution tracking and parsing
+- Position time tracking (seconds at each position)
+- Enhanced player stats aggregation
+- Match validation (proper starting conditions)
+- Direct PostgreSQL import via MatchImporter
+"""
+
 import json
-import csv
-from collections import Counter, defaultdict, deque
 import paramiko
 import re
 from datetime import datetime
 import os
 import sys
 import asyncio
+from pathlib import Path
+import logging
+from typing import Dict, List, Optional, Any, Tuple
+from collections import defaultdict
 
 # --- Path fix ---
-# Add the project root to the Python path to allow imports from ios_bot
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 # --- End Path fix ---
 
-# Import database manager
-from ios_bot.database_manager import get_servers_for_compile_stats
+# Import database and match importer
+from ios_bot.db import Database
+from ios_bot.utils.match_importer import MatchImporter
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv(os.path.join(project_root, '.env'))
+
+# Initialize database connection
+SUPABASE_DB_URL = os.getenv('SUPABASE_DB_URL')
+db = None
+
+async def init_db():
+    """Initialize database connection"""
+    global db
+    if db is None:
+        db = Database(SUPABASE_DB_URL)
+        await db.initialize()
+    return db
+
+# Setup logging - reduce verbosity
+logging.basicConfig(level=logging.WARNING)
+logging.getLogger('paramiko').setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
 # --- Configuration ---
-# Use absolute paths to ensure the script can be run from anywhere
 script_dir = os.path.dirname(os.path.abspath(__file__))
-player_stats_filename = os.path.join(script_dir, 'player_stats.csv')
-match_summaries_filename = os.path.join(script_dir, 'match_summaries.csv')
 last_processed_date_filename = os.path.join(script_dir, 'last_processed_date.txt')
 
-def get_servers_sync():
-    """Get servers from database synchronously."""
+
+class MatchValidator:
+    """Validates match data for proper game conditions."""
+    
+    # Position definitions by format
+    POSITIONS_5V5 = ['GK', 'CB', 'LM', 'RM', 'CF']
+    POSITIONS_6V6 = ['GK', 'LB', 'RB', 'CM', 'LW', 'RW']
+    POSITIONS_8V8 = ['GK', 'LB', 'CB', 'RB', 'CM', 'LW', 'CF', 'RW']
+    
+    # Minimum players required (including GK)
+    MIN_PLAYERS_5V5 = 9   # 5v5 = 10 players minimum (5 per side)
+    MIN_PLAYERS_6V6 = 10  # 6v6 = 12 players minimum (6 per side)
+    MIN_PLAYERS_8V8 = 15  # 8v8 = 16 players minimum (8 per side)
+    
+    @staticmethod
+    def validate_match_start(match_data: dict, game_format: int) -> Tuple[bool, str]:
+        """Validate that the match had proper starting conditions.
+        
+        Returns:
+            Tuple of (is_valid, reason)
+        """
+        try:
+            # Get lineup at kickoff (t=0)
+            kickoff_lineup = MatchValidator._get_lineup_at_time(match_data, 0)
+            
+            # Check minimum players
+            if game_format not in [5, 6, 8]:
+                return False, f"Unsupported game format: {game_format}"
+            elif game_format == 5:
+                min_required = MatchValidator.MIN_PLAYERS_5V5
+            elif game_format == 6:
+                min_required = MatchValidator.MIN_PLAYERS_6V6
+            else:  # game_format == 8
+                min_required = MatchValidator.MIN_PLAYERS_8V8
+            
+            total_players = len(kickoff_lineup['home']) + len(kickoff_lineup['away'])
+            
+            if total_players < min_required:
+                return False, f"Insufficient players at kickoff: {total_players}/{min_required} required"
+            
+            # Check for at least one goalkeeper total (either team)
+            home_has_gk = any(p['position'] == 'GK' for p in kickoff_lineup['home'])
+            away_has_gk = any(p['position'] == 'GK' for p in kickoff_lineup['away'])
+            
+            if not home_has_gk and not away_has_gk:
+                return False, "No goalkeeper found at kickoff (at least 1 required)"
+            
+            return True, "Valid match start"
+        except Exception as e:
+            return False, f"Validation error: {e}"
+    
+    @staticmethod
+    def _get_lineup_at_time(match_data: dict, time_seconds: int) -> Dict[str, List[Dict[str, str]]]:
+        """Get the lineup (players on field) at a specific time."""
+        lineup = {'home': [], 'away': []}
+        
+        players = match_data.get('matchData', {}).get('players', [])
+        
+        for player_data in players:
+            info = player_data.get('info', {})
+            steam_id = info.get('steamId', '')
+            name = info.get('name', 'Unknown')
+            
+            # Check all period segments
+            for period in player_data.get('matchPeriodData', []):
+                period_info = period.get('info', {})
+                start = period_info.get('startSecond', 0)
+                end = period_info.get('endSecond', 0)
+                team = period_info.get('team', '')
+                position = period_info.get('position', '')
+                
+                # Check if player was on field at this time
+                if start <= time_seconds < end and team in ['home', 'away']:
+                    lineup[team].append({
+                        'steamId': steam_id,
+                        'name': name,
+                        'position': position
+                    })
+                    break  # Only count once per player
+        
+        return lineup
+
+
+class EnhancedMatchParser:
+    """Enhanced parser with substitution tracking and position time analysis."""
+    
+    @staticmethod
+    def parse_match_with_details(match_data: dict) -> Optional[Dict[str, Any]]:
+        """Parse match with full details including substitutions and position times.
+        
+        Returns:
+            Dict with:
+            - match_info: Basic match information
+            - players: Enhanced player data with position times
+            - substitutions: List of substitution events
+            - lineups: Starting and final lineups
+        """
+        try:
+            match_data_obj = match_data.get('matchData', {})
+            match_info = match_data_obj.get('matchInfo', {})
+            stat_types = match_data_obj.get('statisticTypes', [])
+            players_data = match_data_obj.get('players', [])
+            teams = match_data_obj.get('teams', [])
+            
+            if len(teams) < 2:
+                return None
+            
+            # Extract basic match info
+            game_format = match_info.get('format', 0)
+            start_time = match_info.get('startTime')
+            end_time = match_info.get('endTime')
+            
+            home_team = teams[0]['matchTotal']
+            away_team = teams[1]['matchTotal']
+            home_score = home_team['statistics'][12]  # Goals stat index
+            away_score = away_team['statistics'][12]
+            
+            # Build enhanced player data
+            players = EnhancedMatchParser._build_player_data(players_data, stat_types)
+            
+            # Extract substitutions
+            substitutions = EnhancedMatchParser._extract_substitutions(players)
+            
+            # Get starting and final lineups
+            starting_lineup = EnhancedMatchParser._get_lineup_at_time(players_data, 0)
+            final_lineup = EnhancedMatchParser._get_lineup_at_time(players_data, end_time - start_time if end_time and start_time else 5400)
+            
+            return {
+                'match_info': {
+                    'format': game_format,
+                    'start_time': start_time,
+                    'end_time': end_time,
+                    'duration': (end_time - start_time) if end_time and start_time else 0,
+                    'home_team': home_team['name'],
+                    'away_team': away_team['name'],
+                    'home_score': home_score,
+                    'away_score': away_score,
+                },
+                'players': players,
+                'substitutions': substitutions,
+                'lineups': {
+                    'starting': starting_lineup,
+                    'final': final_lineup
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error in enhanced parsing: {e}")
+            return None
+    
+    @staticmethod
+    def _build_player_data(players_data: List[dict], stat_types: List[str]) -> Dict[str, Dict]:
+        """Build enhanced player data with position time tracking."""
+        players = {}
+        empty_stats = lambda: {k: 0 for k in stat_types}
+        
+        for player_entry in players_data:
+            info = player_entry.get('info', {})
+            steam_id = info.get('steamId', '')
+            name = info.get('name', 'Unknown')
+            
+            if not steam_id or steam_id == 'Bot' or name == 'KeeperBotHome':
+                continue
+            
+            if steam_id not in players:
+                players[steam_id] = {
+                    'steam_id': steam_id,
+                    'name': name,
+                    'teams_played_for': set(),
+                    'stats_by_team': {
+                        'home': empty_stats(),
+                        'away': empty_stats(),
+                        'overall': empty_stats(),
+                    },
+                    'position_seconds_by_team': {
+                        'home': defaultdict(int),
+                        'away': defaultdict(int),
+                        'overall': defaultdict(int),
+                    },
+                    'started': False,
+                    'first_appearance_time': None,
+                    'main_position_by_team': {'home': None, 'away': None},
+                    'main_position_overall': None,
+                }
+            
+            # Process each period segment
+            for period in player_entry.get('matchPeriodData', []):
+                period_info = period.get('info', {})
+                stats = period.get('statistics', [])
+                
+                start = period_info.get('startSecond', 0)
+                end = period_info.get('endSecond', 0)
+                team = period_info.get('team', '')
+                position = period_info.get('position', '')
+                
+                if team not in ['home', 'away']:
+                    continue
+                
+                players[steam_id]['teams_played_for'].add(team)
+                
+                # Track first appearance
+                if players[steam_id]['first_appearance_time'] is None or start < players[steam_id]['first_appearance_time']:
+                    players[steam_id]['first_appearance_time'] = start
+                
+                # Check if started (present at kickoff within 10 seconds)
+                if start < 10 and end > 0:
+                    players[steam_id]['started'] = True
+                
+                # Track time on position
+                secs = max(0, end - start)
+                players[steam_id]['position_seconds_by_team'][team][position] += secs
+                players[steam_id]['position_seconds_by_team']['overall'][position] += secs
+                
+                # Aggregate stats
+                for i, stat_name in enumerate(stat_types):
+                    val = int(stats[i]) if i < len(stats) else 0
+                    players[steam_id]['stats_by_team'][team][stat_name] += val
+                    players[steam_id]['stats_by_team']['overall'][stat_name] += val
+        
+        # Compute main positions
+        for steam_id, p in players.items():
+            for team in ['home', 'away']:
+                pos_map = p['position_seconds_by_team'][team]
+                if pos_map:
+                    best = sorted(pos_map.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+                    p['main_position_by_team'][team] = best
+            
+            overall_map = p['position_seconds_by_team']['overall']
+            if overall_map:
+                best_overall = sorted(overall_map.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+                p['main_position_overall'] = best_overall
+            
+            # Convert sets/defaultdicts to normal types
+            p['teams_played_for'] = sorted(list(p['teams_played_for']))
+            p['position_seconds_by_team']['home'] = dict(p['position_seconds_by_team']['home'])
+            p['position_seconds_by_team']['away'] = dict(p['position_seconds_by_team']['away'])
+            p['position_seconds_by_team']['overall'] = dict(p['position_seconds_by_team']['overall'])
+        
+        return players
+    
+    @staticmethod
+    def _extract_substitutions(players: Dict[str, Dict]) -> List[Dict]:
+        """Extract substitution events from player data."""
+        substitutions = []
+        
+        # Track players who switched teams mid-match
+        for steam_id, player in players.items():
+            if len(player['teams_played_for']) > 1:
+                # Player switched teams - this is a substitution
+                substitutions.append({
+                    'player_steam_id': steam_id,
+                    'player_name': player['name'],
+                    'teams': player['teams_played_for'],
+                    'first_appearance': player['first_appearance_time']
+                })
+        
+        return substitutions
+    
+    @staticmethod
+    def _get_lineup_at_time(players_data: List[dict], time_seconds: int) -> Dict[str, List[Dict]]:
+        """Get lineup at specific time."""
+        lineup = {'home': [], 'away': []}
+        
+        for player_entry in players_data:
+            info = player_entry.get('info', {})
+            steam_id = info.get('steamId', '')
+            name = info.get('name', 'Unknown')
+            
+            if name == 'KeeperBotHome':
+                continue
+            
+            for period in player_entry.get('matchPeriodData', []):
+                period_info = period.get('info', {})
+                start = period_info.get('startSecond', 0)
+                end = period_info.get('endSecond', 0)
+                team = period_info.get('team', '')
+                position = period_info.get('position', '')
+                
+                if start <= time_seconds < end and team in ['home', 'away']:
+                    lineup[team].append({
+                        'steam_id': steam_id,
+                        'name': name,
+                        'position': position
+                    })
+                    break
+        
+        return lineup
+
+
+def is_bot_game(match_data: dict) -> bool:
+    """Check if match contains KeeperBot (bot game)."""
     try:
-        # Create a new event loop for this thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        servers = loop.run_until_complete(get_servers_for_compile_stats())
-        loop.close()
+        players = match_data.get('matchData', {}).get('players', [])
+        for player in players:
+            info = player.get('info', {})
+            name = info.get('name', '')
+            if 'KeeperBot' in name or name == 'KeeperBotHome' or info.get('steamId', '') == 'Bot':
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def is_valid_format(match_data: dict) -> bool:
+    """Check if match format is valid (8v8 or 6v6)."""
+    try:
+        format_num = match_data.get('matchData', {}).get('matchInfo', {}).get('format')
+        return format_num in [8, 6, 5]
+    except Exception:
+        return False
+
+
+async def get_servers():
+    """Get servers from database asynchronously."""
+    await init_db()
+    try:
+        servers = await db.servers.get_servers_for_compile_stats()
         
         if not servers:
-            print("Warning: No servers found in database with SFTP details.")
-            print("Make sure servers have been added with SFTP IP, host username, and host password.")
+            print("⚠️ No servers found in database with SFTP details.", flush=True)
             return []
-        
-        for server in servers:
-            print(f"  - {server['host']}:{server['port']} (user: {server['user']})")
         
         return servers
     except Exception as e:
-        print(f"Error getting servers from database: {e}")
-        print("Falling back to empty server list.")
+        print(f"❌ Error getting servers from database: {e}", flush=True)
         return []
 
-def get_last_processed_date():
-    """Reads the last processed date from the file."""
-    if not os.path.exists(last_processed_date_filename):
-        # If file doesn't exist, try to get it from match_summaries.csv
-        last_dt = get_last_match_datetime()
-        if last_dt:
-            save_last_processed_date(last_dt)
-            return last_dt
-        return None
+
+async def get_last_processed_date():
+    """Get the last processed date from database (most recent match datetime)."""
+    await init_db()
     try:
-        with open(last_processed_date_filename, 'r') as f:
-            date_str = f.read().strip()
-            return datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
-    except (IOError, ValueError):
-        # If file is corrupted, try to get it from match_summaries.csv
-        last_dt = get_last_match_datetime()
-        if last_dt:
-            save_last_processed_date(last_dt)
-            return last_dt
+        query = "SELECT MAX(datetime) as last_match FROM MATCH_STATS"
+        result = await db.pool.fetchrow(query)
+        
+        if result and result['last_match']:
+            return result['last_match']
+        
+        # Fallback to file if database is empty
+        if os.path.exists(last_processed_date_filename):
+            with open(last_processed_date_filename, 'r') as f:
+                date_str = f.read().strip()
+                return datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+        
+        return None
+    except Exception as e:
+        logger.error(f"Error getting last processed date: {e}")
         return None
 
-def save_last_processed_date(date):
-    """Saves the last processed date to the file."""
+
+async def save_last_processed_date(date):
+    """Save the last processed date to file (backup)."""
     try:
         with open(last_processed_date_filename, 'w') as f:
             f.write(date.strftime('%Y-%m-%d %H:%M:%S'))
-        print(f"Saved last processed date: {date}")
+        logger.info(f"Saved last processed date: {date}")
     except IOError as e:
-        print(f"Warning: Could not save last processed date: {e}")
+        logger.warning(f"Could not save last processed date: {e}")
 
-def get_last_match_datetime():
-    """Reads the match summaries CSV and returns the datetime of the most recent match."""
-    if not os.path.exists(match_summaries_filename):
-        return None
-    last_dt = None
-    try:
-        with open(match_summaries_filename, 'r', newline='', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                try:
-                    dt = datetime.strptime(row['datetime'], '%Y-%m-%d %H:%M:%S')
-                    if last_dt is None or dt > last_dt:
-                        last_dt = dt
-                except (ValueError, KeyError):
-                    continue
-    except (IOError, StopIteration):
-        return None
-    return last_dt
 
-def load_existing_data():
-    """
-    Loads existing data from both CSVs.
-    Returns a set of processed match_ids and the full player_stats data.
-    """
-    processed_match_ids = set()
-    if os.path.exists(match_summaries_filename):
-        try:
-            with open(match_summaries_filename, 'r', newline='', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                # Ensure match_id column exists before trying to read it
-                if reader.fieldnames and 'match_id' in reader.fieldnames:
-                    for row in reader:
-                        processed_match_ids.add(row['match_id'])
-        except (IOError, StopIteration, KeyError) as e:
-            print(f"Warning: Could not properly read existing match summaries. {e}")
-
-    player_stats = []
-    header = []
-    if os.path.exists(player_stats_filename):
-        try:
-            with open(player_stats_filename, 'r', newline='', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                header = reader.fieldnames
-                player_stats = list(reader)
-        except (IOError, StopIteration):
-            pass # File might be empty
-            
-    return processed_match_ids, player_stats, header if header else None
-
-def calculate_player_scores(player_data, stat_map):
-    """
-    Calculates the summary scores for a single player for one match.
-    - Attacker Score: Raw number of goals.
-    - Playmaker Score: Sum of assists, second assists, chances created, and key passes.
-    - Defender Score: Sum of interceptions and completed sliding tackles, minus fouls committed.
-    - Goalkeeper Score: Sum of saves and caught saves, minus goals conceded.
-    """
-    player_stats = [0] * len(stat_map)
-    for period in player_data['matchPeriodData']:
-        for i, stat_val in enumerate(period['statistics']):
-            player_stats[i] += stat_val
+def download_match_files_from_server(server_config, last_processed_dt, processed_match_ids):
+    """Download and parse match JSON files from a single server via SFTP.
     
-    scores = {
-        'attacker': player_stats[stat_map.get('goals', 0)],
-        'playmaker': (player_stats[stat_map.get('assists', 0)] + 
-                      player_stats[stat_map.get('secondAssists', 0)] + 
-                      player_stats[stat_map.get('chancesCreated', 0)] + 
-                      player_stats[stat_map.get('keyPasses', 0)]),
-        'defender': (player_stats[stat_map.get('interceptions', 0)] + 
-                     player_stats[stat_map.get('slidingTacklesCompleted', 0)] - 
-                     player_stats[stat_map.get('fouls', 0)]),
-        'goalkeeper': (player_stats[stat_map.get('keeperSaves', 0)] + 
-                       player_stats[stat_map.get('keeperSavesCaught', 0)] - 
-                       player_stats[stat_map.get('goalsConceded', 0)])
-    }
-    return scores
-
-def analyze_lineups(match_data):
+    Returns list of tuples: (match_data, file_dt, match_id, filename)
+    Mimics original compile_stats.py SFTP logic - reads directly from SFTP without temp files.
     """
-    Analyzes the lineup changes throughout a match and returns initial lineups, 
-    final lineups, and substitution summary.
-    """
-    players = match_data["players"]
-    format = match_data["matchInfo"]["format"]
-
-    # Determine position order based on format
-    if format == 8:
-        POSITION_ORDER = ["GK", "LB", "CB", "RB", "CM", "LW", "RW", "CF"]
-    elif format == 6:
-        POSITION_ORDER = ["GK", "LB", "RB", "LW", "RW"]
-    else:
-        print(f"Unknown format: {format}")
-        return {}, {}, []
-
-    # Gather all periods for all players
-    periods = []
-    for player in players:
-        info = player["info"]
-        name = info["name"]
-        steamid = info["steamId"]
-        for mpd in player.get("matchPeriodData", []):
-            mpd_info = mpd["info"]
-            team = mpd_info["team"]
-            position = mpd_info["position"]
-            start = mpd_info["startSecond"]
-            end = mpd_info["endSecond"]
-            periods.append({
-                "name": name,
-                "steamid": steamid,
-                "team": team,
-                "position": position,
-                "start": start,
-                "end": end
-            })
-
-    if not periods:
-        return {}, {}, []
-
-    # Find total match time
-    total_match_time = max(p["end"] for p in periods)
-
-    # Build timeline of all changes
-    timeline = []
-    for p in periods:
-        timeline.append((p["start"], "in", p))
-        timeline.append((p["end"], "out", p))
-    timeline.sort(key=lambda x: (x[0], 0 if x[1] == "in" else 1))
-
-    # Initial lineup at t=0
-    initial_lineup = defaultdict(dict)
-    for p in periods:
-        if p["start"] == 0:
-            initial_lineup[p["team"]][p["position"]] = (p["name"], p["steamid"])
-
-    # Track current lineup and player positions
-    current_lineup = defaultdict(dict)
-    player_positions = {}  # (name, steamid) -> (team, pos)
-    seen_players = set()
-    subbed_in_players = set()
-    initial_starters = set()
-    sub_in_for = dict()  # (name, steamid) -> (name, steamid) they replaced
-    swap_events = set()  # (t, team, pos1, pos2) to avoid duplicate swap prints
-
-    # Track a queue of players who left each position and have not yet been replaced
-    left_queue = defaultdict(deque)  # (team, pos) -> deque of (name, steamid, time)
-
-    for team in initial_lineup:
-        for pos in initial_lineup[team]:
-            current_lineup[team][pos] = initial_lineup[team][pos]
-            player_positions[initial_lineup[team][pos]] = (team, pos)
-            seen_players.add(initial_lineup[team][pos])
-            initial_starters.add(initial_lineup[team][pos])
-
-    # To avoid duplicate messages
-    printed_events = set()
-    substitution_pairs = []  # (left_player, subbed_in_player, position, team, time_left, time_in)
-
-    for idx, (t, action, p) in enumerate(timeline):
-        team = p["team"]
-        pos = p["position"]
-        name = p["name"]
-        steamid = p["steamid"]
-        player_key = (name, steamid)
-        key = (team, pos)
-        event_id = (t, action, name, steamid, team, pos)
-        if event_id in printed_events:
-            continue
-        printed_events.add(event_id)
-
-        # Detect swaps: look ahead for another "in" at the same time for the same team
-        if action == "in" and t > 0:
-            # Find if another player is also "in" at this time for the same team
-            for jdx in range(idx + 1, len(timeline)):
-                t2, action2, p2 = timeline[jdx]
-                if t2 != t or action2 != "in":
-                    break
-                team2 = p2["team"]
-                pos2 = p2["position"]
-                name2 = p2["name"]
-                steamid2 = p2["steamid"]
-                # Only allow swaps within the same team and different positions
-                if team2 == team and pos2 != pos:
-                    # Check if both positions were occupied before
-                    if pos in current_lineup[team] and pos2 in current_lineup[team]:
-                        prev1 = current_lineup[team][pos]
-                        prev2 = current_lineup[team][pos2]
-                        # If player1 is subbing into pos2 and player2 is subbing into pos1, it's a swap
-                        if (name2, steamid2) == prev1 and (name, steamid) == prev2:
-                            swap_id = (t, team, pos, pos2)
-                            if swap_id not in swap_events:
-                                sub_in_for[(name, steamid)] = prev2
-                                sub_in_for[(name2, steamid2)] = prev1
-                                subbed_in_players.add((name, steamid))
-                                subbed_in_players.add((name2, steamid2))
-                            break
-            if 'msg' in locals():
-                # Perform the swap in the lineup
-                prev1 = current_lineup[team][pos]
-                prev2 = current_lineup[team][pos2]
-                current_lineup[team][pos] = (name, steamid)
-                current_lineup[team][pos2] = (name2, steamid2)
-                player_positions[(name, steamid)] = (team, pos)
-                player_positions[(name2, steamid2)] = (team, pos2)
-                seen_players.add((name, steamid))
-                seen_players.add((name2, steamid2))
-                continue  # Skip the rest of the logic for this event
-
-        if action == "in":
-            if key in current_lineup[team]:
-                prev_name, prev_steamid = current_lineup[team][pos]
-                prev_key = (prev_name, prev_steamid)
-                if prev_key != player_key:
-                    if player_key in seen_players:
-                        pass
-                    else:
-                        subbed_in_players.add(player_key)
-                        sub_in_for[player_key] = prev_key
-                    seen_players.add(player_key)
-                else:
-                    # Same player, possibly re-entering (rare)
-                    pass
-            else:
-                # If position was empty, always pop from left_queue if available
-                if left_queue[(team, pos)]:
-                    left_name, left_steamid, left_time = left_queue[(team, pos)].popleft()
-                    sub_in_for[player_key] = (left_name, left_steamid)
-                    subbed_in_players.add(player_key)
-                    # Track the substitution pair
-                    substitution_pairs.append((
-                        (left_name, left_steamid),
-                        (name, steamid),
-                        pos,
-                        team,
-                        left_time,
-                        t
-                    ))
-                else:
-                    sub_in_for[player_key] = None
-                    subbed_in_players.add(player_key)
-                seen_players.add(player_key)
-            current_lineup[team][pos] = (name, steamid)
-            player_positions[player_key] = (team, pos)
-        elif action == "out":
-            if key in current_lineup[team] and current_lineup[team][pos][0] == name:
-                del current_lineup[team][pos]
-                if player_key in player_positions:
-                    del player_positions[player_key]
-                left_queue[(team, pos)].append((name, steamid, t))
-
-    # Find match end time
-    match_end_time = total_match_time
-
-    # 1. Find all players who left early (last endSecond < match_end_time)
-    players_left_early = defaultdict(list)  # team -> list of (name, steamid)
-    players_joined_late = defaultdict(list)  # team -> list of (name, steamid, startSecond)
-    player_periods = defaultdict(list)  # (team, steamid) -> list of (start, end, pos)
-
-    for player in players:
-        info = player["info"]
-        name = info["name"]
-        steamid = info["steamId"]
-        periods_this_player = []
-        for mpd in player.get("matchPeriodData", []):
-            mpd_info = mpd["info"]
-            team = mpd_info["team"]
-            pos = mpd_info["position"]
-            start = mpd_info["startSecond"]
-            end = mpd_info["endSecond"]
-            periods_this_player.append((start, end, pos))
-            player_periods[(team, steamid)].append((start, end, pos))
-        if periods_this_player:
-            last_end = max(e for s, e, p in periods_this_player)
-            first_start = min(s for s, e, p in periods_this_player)
-            team = player.get("matchPeriodData", [{}])[0].get("info", {}).get("team", None)
-            if last_end < match_end_time and team:
-                players_left_early[team].append((name, steamid))
-            if first_start > 0 and team:
-                players_joined_late[team].append((name, steamid, first_start))
-
-    # 2. For each team, pair new joiners with leavers in order
-    sub_pairs = {}  # (team, name, steamid) -> (left_name, left_steamid)
-    for team in players_left_early:
-        left_queue = deque(players_left_early[team])
-        for join_name, join_steamid, join_start in sorted(players_joined_late[team], key=lambda x: x[2]):
-            if left_queue:
-                left_name, left_steamid = left_queue.popleft()
-                sub_pairs[(team, join_name, join_steamid)] = (left_name, left_steamid)
-
-    # 3. Output initial lineups, final lineups, and substitute summary as tuples
-    def get_lineup_dict(lineup):
-        result = {}
-        for team in ["away", "home"]:
-            result[team] = []
-            for pos in POSITION_ORDER:
-                if pos in lineup[team]:
-                    name, steamid = lineup[team][pos]
-                    result[team].append((pos, name, steamid))
-                else:
-                    result[team].append((pos, None, None))
-        return result
-
-    initial_lineups = get_lineup_dict(initial_lineup)
-    final_lineups = get_lineup_dict(current_lineup)
-    substitute_summary = []
-    for (team, join_name, join_steamid), (left_name, left_steamid) in sub_pairs.items():
-        substitute_summary.append((
-            team,
-            (left_name, left_steamid),
-            (join_name, join_steamid)
-        ))
-
-    return initial_lineups, final_lineups, substitute_summary
-
-def main():
-    print("--- Starting Stats Compilation ---")
-
-    # --- Load existing data FIRST ---
-    processed_match_ids, player_stats_data, player_stats_header = load_existing_data()
-    print(f"Found {len(processed_match_ids)} previously processed matches.")
-
-    # Get the last processed date
-    last_processed_date = get_last_processed_date()
-    if last_processed_date:
-        print(f"Last processed match date: {last_processed_date}")
-    else:
-        print("No last processed date found. Will process all available matches.")
-
-    # --- SFTP Connection and file filtering ---
     new_json_files = []
-    for server in get_servers_sync():
-        transport, sftp = None, None
-        try:
-            print(f"Connecting to {server['host']}...")
-            transport = paramiko.Transport((server['host'], server['port']))
-            transport.connect(username=server['user'], password=server['pass'])
-            sftp = paramiko.SFTPClient.from_transport(transport)
-            
-            if sftp is None:
-                print(f"Failed to create SFTP client for {server['host']}")
-                continue
-                
-            sftp.chdir(server['dir'])
-            print(sftp.chdir(server['dir']))
-            
-            # Get all JSON files and their dates
-            server_files = []
-            all_json_files = [f for f in sftp.listdir() if f.endswith('.json')]
-            print(f"  -> Found {len(all_json_files)} total JSON files on {server['host']}")
-            
-            skipped_old = 0
-            skipped_processed = 0
-            
-            for filename in all_json_files:
-                try:
-                    # Extract datetime from filename
-                    datetime_str = '_'.join(filename.split('_')[:2])
-                    file_dt = datetime.strptime(datetime_str, '%Y.%m.%d_%Hh.%Mm.%Ss')
-                    
-                    # Skip files older than the last processed date
-                    if last_processed_date and file_dt <= last_processed_date:
-                        skipped_old += 1
-                        continue
-                    
-                    # Skip if match_id already processed
-                    match_id = filename.replace('.json', '').replace('.', '').replace('_', '').replace('h', '').replace('m', '').replace('s', '')
-                    if match_id in processed_match_ids:
-                        skipped_processed += 1
-                        continue
-                    
-                    server_files.append((filename, file_dt))
-                except (ValueError, IndexError) as e:
-                    print(f"     ERROR: Could not parse datetime from {filename}. Error: {e}")
-                    continue
-            
-            print(f"  -> Skipped {skipped_old} old files, {skipped_processed} already processed")
-            
-            # Sort files by date (newest first)
-            server_files.sort(key=lambda x: x[1], reverse=True)
-            print(f"Found {len(server_files)} new files on {server['host']}")
-            
-            # Process files in order
-            for filename, file_dt in server_files:
-                try:
-                    with sftp.open(filename, 'r') as f:
-                        f.prefetch()
-                        match_data = json.load(f)
-                        match_id = filename.replace('.json', '').replace('.', '').replace('_', '').replace('h', '').replace('m', '').replace('s', '')
-                        new_json_files.append((match_data, file_dt, match_id, filename))
-                except Exception as e:
-                    print(f"     ERROR: Failed to read file {filename} - {e}")
-                    continue
-                    
-        except Exception as e:
-            print(f"Could not connect or process files on {server['host']}: {e}")
-        finally:
-            if sftp: sftp.close()
-            if transport: transport.close()
-
-    if not new_json_files:
-        print("No new match files found. Exiting.")
-        return
-
-    # Sort all files by date (newest first)
-    new_json_files.sort(key=lambda x: x[1], reverse=True)
+    sftp = None
+    transport = None
     
-    if new_json_files:
-        oldest_file_date = min(x[1] for x in new_json_files)
-        newest_file_date = max(x[1] for x in new_json_files)
-    else:
-        print("\nNo files will be processed.")
-    
-    # --- Schema Management: Build a master header ---
-    master_stat_types = set()
-    for data, _, _, _ in new_json_files:
-        try:
-            master_stat_types.update(data['matchData']['statisticTypes'])
-        except KeyError:
-            continue
-
-    base_header = ['match_id', 'datetime', 'Steam ID', 'Name', 'Team Name', 'Opponent Team Name', 'Team Side', 'Position']
-    
-    if player_stats_header:
-        master_stat_types.update(player_stats_header[8:])
-    
-    final_player_stats_header = base_header + sorted(list(master_stat_types))
-    
-    rewrite_needed = False
-    if not player_stats_header or set(final_player_stats_header) != set(player_stats_header):
-        if player_stats_header and set(final_player_stats_header) != set(player_stats_header):
-            print("Schema change detected. Player stats file will be completely rewritten.")
-        rewrite_needed = True
-
-    # --- Main Processing Loop ---
-    new_match_summaries = []
-    new_player_stats = []
-    latest_processed_date = last_processed_date
-    print(f"\n--- Processing {len(new_json_files)} files ---")
-    
-    processed_count = 0
-    skipped_bot_games = 0
-    skipped_wrong_format = 0
-    skipped_already_processed = 0
-    
-    for data, match_dt, match_id, filename in new_json_files:
-        if match_id in processed_match_ids:
-            skipped_already_processed += 1
-            print(f"  -> Skipped (already processed): {filename}")
-            continue
-        try:
-            match_datetime_str = match_dt.strftime('%Y-%m-%d %H:%M:%S')
-            print(f"  -> Processing: {filename} (date: {match_dt})")
-            data = data['matchData']
-
-            # --- KeeperBot Check ---
-            is_bot_game = False
-            for player in data.get('players', []):
-                info = player.get('info', {})
-                if info.get('name') == 'KeeperBotHome':
-                    is_bot_game = True
-                    break
-            if is_bot_game:
-                skipped_bot_games += 1
-                continue
-            # --- End KeeperBot Check ---
-
-            # --- Game Type Check ---
-            is_proper_game = False
-            format = data.get('matchInfo', {}).get('format')
-            if format == 8:
-                game_type = '8v8'
-                is_proper_game = True
-            elif format == 6:
-                game_type = '6v6'
-                is_proper_game = True
-            if not is_proper_game:
-                skipped_wrong_format += 1
-                continue
-            # --- End Game Type Check ---
-            
-            # --- Lineup Analysis ---
-            initial_lineups, final_lineups, substitution_summary = analyze_lineups(data)
-            
-            current_stat_types = data['statisticTypes']
-            
-            stat_map = {name: i for i, name in enumerate(current_stat_types)}
-            team_name_map = {team['matchTotal']['side']: team['matchTotal']['name'] for team in data['teams']}
-            home_team, away_team = team_name_map.get('home', 'N/A'), team_name_map.get('away', 'N/A')
-            
-            # Robustly find home/away scores using the statistics array
-            home_score = 0
-            away_score = 0
-            try:
-                # The 13th element (index 12) is 'goals'
-                goals_index = 12 
-                for team in data['teams']:
-                    if team.get('matchTotal', {}).get('side') == 'home':
-                        home_score = team['matchTotal']['statistics'][goals_index]
-                    elif team.get('matchTotal', {}).get('side') == 'away':
-                        away_score = team['matchTotal']['statistics'][goals_index]
-                scoreline = f"{home_score}-{away_score}"
-            except (IndexError, KeyError) as e:
-                scoreline = "N/A"
-
-            for player in data['players']:
-                steam_id, player_name = player['info']['steamId'], player['info']['name']
-                
-                player_team_name = 'N/A'
-                player_opponent_team_name = 'N/A'
-                player_side = 'N/A'
-                if player.get('matchPeriodData'):
-                    player_side = player['matchPeriodData'][0]['info']['team']
-                    player_team_name = team_name_map.get(player_side, 'N/A')
-                    player_opponent_team_name = team_name_map.get('away' if player_side == 'home' else 'home', 'N/A')
-
-                player_match_stats = [0] * len(current_stat_types)
-                for period in player['matchPeriodData']:
-                    for i, stat_val in enumerate(period['statistics']):
-                        player_match_stats[i] += stat_val
-
-                # Determine player position more robustly
-                player_position = 'N/A'
-                if player.get('matchPeriodData'):
-                    # Collect all positions from all periods to find the most common one
-                    positions = []
-                    for period in player['matchPeriodData']:
-                        pos = period.get('info', {}).get('position')
-                        if pos and pos != 'N/A' and str(pos).lower() not in ['nan', 'null', 'none', '']:
-                            positions.append(pos)
-                    
-                    if positions:
-                        # Find the most common position
-                        from collections import Counter
-                        position_counter = Counter(positions)
-                        player_position = position_counter.most_common(1)[0][0]
-
-                new_player_stat_row = {
-                    'match_id': match_id,
-                    'datetime': match_datetime_str,
-                    'Steam ID': steam_id,
-                    'Name': player_name,
-                    'Team Name': player_team_name,
-                    'Opponent Team Name': player_opponent_team_name,
-                    'Team Side': player_side,
-                    'Position': player_position,
-                }
-                for i, stat_name in enumerate(current_stat_types):
-                    new_player_stat_row[stat_name] = player_match_stats[i]
-                new_player_stats.append(new_player_stat_row)
-
-            new_match_summaries.append({
-                'match_id': match_id,
-                'datetime': match_datetime_str, 
-                'home_team': home_team, 
-                'away_team': away_team, 
-                'scoreline': scoreline,
-                'game_type': game_type,
-                'initial_lineups': json.dumps(initial_lineups),
-                'final_lineups': json.dumps(final_lineups),
-                'substitution_summary': json.dumps(substitution_summary)
-            })
-            processed_match_ids.add(match_id)
-            processed_count += 1
-            
-            # Update the latest processed date
-            if latest_processed_date is None or match_dt > latest_processed_date:
-                print(f"     -> Updating latest processed date from {latest_processed_date} to {match_dt}")
-                latest_processed_date = match_dt
-            else:
-                print(f"     -> Date {match_dt} is not newer than current latest {latest_processed_date}")
-
-        except (KeyError, ValueError, IndexError) as e:
-            print(f"  -> Skipping match {filename} due to processing error: {e}")
-            continue
-    
-    # Print processing summary
-    print(f"Processing complete:")
-    print(f"  - Processed: {processed_count} matches")
-    print(f"  - Skipped: {skipped_bot_games} bot games, {skipped_wrong_format} wrong format, {skipped_already_processed} already processed")
-    print(f"  - Latest processed date after processing: {latest_processed_date}")
-
-    # --- Write updates to CSV files ---
-    if new_match_summaries:
-        is_new_file = not os.path.exists(match_summaries_filename)
-        with open(match_summaries_filename, 'a', newline='', encoding='utf-8') as f:
-            header = list(new_match_summaries[0].keys())
-            writer = csv.DictWriter(f, fieldnames=header)
-            if is_new_file:
-                writer.writeheader()
-            writer.writerows(new_match_summaries)
-        print("Done.")
-
-    if new_player_stats:
-        if rewrite_needed:
-            all_stats = player_stats_data + new_player_stats
-            with open(player_stats_filename, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=final_player_stats_header, extrasaction='ignore')
-                writer.writeheader()
-                writer.writerows(all_stats)
-        else:
-            is_new_file = not os.path.exists(player_stats_filename)
-            with open(player_stats_filename, 'a', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=final_player_stats_header, extrasaction='ignore')
-                if is_new_file:
-                    writer.writeheader()
-                writer.writerows(new_player_stats)
-        print("Done.")
-    
-    # Save the latest processed date
-    if latest_processed_date:
-        save_last_processed_date(latest_processed_date)
-        print(f"Updated last processed date to: {latest_processed_date}")
-    
-    print(f"\n--- Stats Compilation Finished ---")
-    
-    # --- Automatic Database Population ---
-    should_run_preprocessing = new_match_summaries or check_if_first_time_setup()
-    
-    if should_run_preprocessing:
-        print("\n--- Auto-populating Database from CSV ---")
-        try:
-            # Import the auto-populate function
-            from ios_bot.database_manager import auto_populate_database_from_csv
-            
-            # Create a new event loop for the auto-population
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(auto_populate_database_from_csv())
-            loop.close()
-            
-            print("✅ Database auto-population completed successfully!")
-            print("   Tournament functionality will now use fast database queries.")
-            
-        except Exception as e:
-            print(f"⚠️ Warning: Database auto-population failed: {e}")
-            print("   Tournament functionality may be slower until database is populated.")
-    else:
-        print("No new matches processed and database appears to be populated, skipping database auto-population.")
-
-
-def check_if_first_time_setup():
-    """Check if this is the first time setup by checking if database tables are empty."""
     try:
-        # Import and check database
-        import asyncio
-        from ios_bot.database_manager import execute_query
+        host = server_config['host']
+        port = server_config['port']  # SFTP port (8822)
+        username = server_config['user']
+        password = server_config.get('pass')
+        # Directory path is pre-computed in get_servers_for_compile_stats() using address port
+        remote_dir = server_config['dir']
         
-        # Create a new event loop for the check
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        print(f"   🔌 Connecting to {host}:{port} as {username}...", flush=True)
         
-        # Check if MATCH_STATS table has any data
-        match_result = loop.run_until_complete(execute_query("SELECT COUNT(*) as count FROM MATCH_STATS", fetchone=True))
-        team_result = loop.run_until_complete(execute_query("SELECT COUNT(*) as count FROM IOSCA_TEAMS", fetchone=True))
+        transport = paramiko.Transport((host, port))
+        transport.connect(username=username, password=password)
+        sftp = paramiko.SFTPClient.from_transport(transport)
         
-        loop.close()
+        print(f"   ✅ Connected! Changing to directory: {remote_dir}", flush=True)
         
-        match_count = match_result.get('count', 0) if match_result else 0
-        team_count = team_result.get('count', 0) if team_result else 0
+        try:
+            sftp.chdir(remote_dir)
+            files = sftp.listdir()
+        except FileNotFoundError:
+            print(f"   ❌ Directory not found: {remote_dir}", flush=True)
+            return new_json_files
         
-        print(f"Database check: Found {match_count} matches and {team_count} teams")
+        json_files = [f for f in files if f.endswith('.json')]
+        print(f"   📁 Found {len(json_files)} JSON files", flush=True)
         
-        # Return True if either matches or teams are empty (need to populate)
-        return match_count == 0 or team_count == 0
+        skipped_old = 0
+        skipped_processed = 0
+        server_files = []
+        newest_file = None  # Track most recent file by filename datetime
+        
+        for filename in json_files:
+            try:
+                # Extract datetime from filename (YYYY.MM.DD_HHh.MMm.SSs.json)
+                datetime_str = '_'.join(filename.split('_')[:2])
+                file_dt = datetime.strptime(datetime_str, '%Y.%m.%d_%Hh.%Mm.%Ss')
+                
+                # Generate match_id (remove extensions and special chars)
+                match_id = filename.replace('.json', '').replace('.', '').replace('_', '').replace('h', '').replace('m', '').replace('s', '')
+                
+                # Track the most recent file regardless of cutoff
+                if newest_file is None or file_dt > newest_file[1]:
+                    newest_file = (filename, file_dt, match_id)
+                
+                # Skip if already processed
+                if match_id in processed_match_ids:
+                    skipped_processed += 1
+                    continue
+                
+                # Skip if older than last processed date
+                if last_processed_dt and file_dt <= last_processed_dt:
+                    skipped_old += 1
+                    continue
+                
+                server_files.append((filename, file_dt, match_id))
+                
+            except (ValueError, IndexError) as e:
+                logger.error(f"  ✗ Could not parse datetime from {filename}: {e}")
+                continue
+
+        # Always include the most recent file if it isn't in the DB yet
+        if newest_file:
+            newest_filename, newest_dt, newest_match_id = newest_file
+            if newest_match_id not in processed_match_ids:
+                if not any(m_id == newest_match_id for _, _, m_id in server_files):
+                    server_files.append((newest_filename, newest_dt, newest_match_id))
+                    print(f"   🔎 Forcing latest file check: {newest_filename}", flush=True)
+        
+        if skipped_old > 0 or skipped_processed > 0:
+            print(f"   ⏭️ Skipped {skipped_old} old, {skipped_processed} already processed", flush=True)
+        
+        # Sort files by date (newest first, like original)
+        server_files.sort(key=lambda x: x[1], reverse=True)
+        print(f"   📊 {len(server_files)} new files to read", flush=True)
+        
+        # Read files directly from SFTP (no temp files)
+        read_count = 0
+        error_count = 0
+        for filename, file_dt, match_id in server_files:
+            try:
+                with sftp.open(filename, 'r') as f:
+                    f.prefetch()
+                    match_data = json.load(f)
+                    new_json_files.append((match_data, file_dt, match_id, filename))
+                    read_count += 1
+                    # Log progress every 100 files
+                    if read_count % 100 == 0:
+                        print(f"   📖 Read {read_count}/{len(server_files)} files...", flush=True)
+            except Exception as e:
+                error_count += 1
+                continue
+        
+        if error_count > 0:
+            print(f"   ⚠️ {error_count} files failed to read", flush=True)
         
     except Exception as e:
-        print(f"Database check failed: {e}")
-        return True  # Assume first time if check fails
+        print(f"   ❌ SFTP Error: {e}", flush=True)
+    finally:
+        if sftp:
+            sftp.close()
+        if transport:
+            transport.close()
+    
+    return new_json_files
 
-if __name__ == "__main__":
-    main()
+
+async def get_processed_match_ids():
+    """Get set of already processed match IDs from database."""
+    await init_db()
+    try:
+        query = "SELECT match_id FROM MATCH_STATS"
+        results = await db.pool.fetch(query)
+        processed = {row['match_id'] for row in results}
+        try:
+            skip_rows = await db.pool.fetch("SELECT match_id FROM MATCH_IMPORT_SKIPS")
+            processed |= {row['match_id'] for row in skip_rows}
+        except Exception:
+            pass
+        return processed
+    except Exception as e:
+        logger.error(f"Error getting processed match IDs: {e}")
+        return set()
+
+
+async def record_match_skip(match_id: str, filename: str, reason: str, match_datetime: Optional[datetime] = None) -> None:
+    """Record a skipped match so it won't be reprocessed."""
+    await init_db()
+    try:
+        await db.pool.execute(
+            """
+            INSERT INTO MATCH_IMPORT_SKIPS (match_id, filename, reason, match_datetime)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (match_id) DO UPDATE SET
+                filename = EXCLUDED.filename,
+                reason = EXCLUDED.reason,
+                match_datetime = COALESCE(EXCLUDED.match_datetime, MATCH_IMPORT_SKIPS.match_datetime),
+                skipped_at = NOW()
+            """,
+            match_id,
+            filename,
+            reason,
+            match_datetime
+        )
+    except Exception as e:
+        logger.warning(f"Failed to record skipped match {match_id}: {e}")
+
+
+async def process_match_files(file_info_list):
+    """Process match JSON files with full validation and import to database.
+    
+    Args:
+        file_info_list: List of tuples (match_data, file_dt, match_id, filename)
+    """
+    if not file_info_list:
+        logger.info("No new match files to process.")
+        return 0
+    
+    logger.info(f"\n--- Processing {len(file_info_list)} match files ---")
+    
+    await init_db()
+    importer = MatchImporter(db)
+    imported_count = 0
+    skipped_bot = 0
+    skipped_format = 0
+    skipped_invalid_start = 0
+    skipped_error = 0
+    latest_datetime = None
+    
+    # Sort by datetime (oldest first for proper chronological import)
+    file_info_list.sort(key=lambda x: x[1])
+    
+    for match_data, file_dt, match_id, filename in file_info_list:
+        try:
+            print(f"\nProcessing: {filename} (date: {file_dt})", flush=True)
+            logger.info(f"\nProcessing: {filename} (date: {file_dt})")
+            
+            # Check for bot games
+            if is_bot_game(match_data):
+                print(f"  ⊘ Skipped: Bot game detected", flush=True)
+                logger.info(f"  ⊘ Skipped: Bot game detected")
+                skipped_bot += 1
+                continue
+            
+            # Check format (8v8 or 6v6)
+            if not is_valid_format(match_data):
+                print(f"  ⊘ Skipped: Invalid format (not 8v8 or 6v6)", flush=True)
+                logger.info(f"  ⊘ Skipped: Invalid format (not 8v8 or 6v6)")
+                skipped_format += 1
+                continue
+            
+            # Validate match start conditions
+            game_format = match_data.get('matchData', {}).get('matchInfo', {}).get('format')
+            is_valid, reason = MatchValidator.validate_match_start(match_data, game_format)
+            
+            if not is_valid:
+                print(f"  ⊘ Skipped: {reason}", flush=True)
+                logger.info(f"  ⊘ Skipped: {reason}")
+                if "Insufficient players at kickoff" in reason:
+                    await record_match_skip(match_id, filename, reason, file_dt)
+                skipped_invalid_start += 1
+                continue
+            
+            # Parse with enhanced parser for detailed data
+            enhanced_data = EnhancedMatchParser.parse_match_with_details(match_data)
+            
+            if not enhanced_data:
+                print(f"  ✗ Failed to parse match data", flush=True)
+                logger.warning(f"  ✗ Failed to parse match data")
+                skipped_error += 1
+                continue
+            
+            # Import match using MatchImporter (pass the raw match_data dict and match_id for deduplication)
+            print(f"  → Attempting to import match...", flush=True)
+            imported_match_id = await importer.import_match_from_json(match_data, match_id_str=match_id)
+            
+            if imported_match_id:
+                imported_count += 1
+                print(f"  ✓ Imported match ID: {imported_match_id}", flush=True)
+                print(f"    Players: {len(enhanced_data['players'])}", flush=True)
+                logger.info(f"  ✓ Imported match ID: {imported_match_id}")
+                logger.info(f"    Players: {len(enhanced_data['players'])}")
+                logger.info(f"    Substitutions: {len(enhanced_data['substitutions'])}")
+                
+                # Track latest datetime
+                if latest_datetime is None or file_dt > latest_datetime:
+                    latest_datetime = file_dt
+            else:
+                print(f"  ✗ Failed to import (may be duplicate or teams not found)", flush=True)
+                logger.warning(f"  ✗ Failed to import (may be duplicate or teams not found)")
+                skipped_error += 1
+                
+        except Exception as e:
+            logger.error(f"  ✗ Error processing {filename}: {e}")
+            skipped_error += 1
+            continue
+    
+    # Update last processed date
+    if latest_datetime:
+        await save_last_processed_date(latest_datetime)
+    
+    logger.info(f"\n--- Import Complete ---")
+    logger.info(f"  Total processed: {len(file_info_list)}")
+    logger.info(f"  Successfully imported: {imported_count}")
+    logger.info(f"  Skipped (bot games): {skipped_bot}")
+    logger.info(f"  Skipped (invalid format): {skipped_format}")
+    logger.info(f"  Skipped (invalid start): {skipped_invalid_start}")
+    logger.info(f"  Skipped (errors): {skipped_error}")
+    
+    return imported_count
+
+
+async def main():
+    """Main function to run the stats compilation."""
+    import time
+    start_time = time.time()
+    
+    print("=== Match Stats Compilation ===", flush=True)
+    
+    # Get servers from database
+    print("🔍 Fetching servers from database...", flush=True)
+    servers = await get_servers()
+    print(f"📊 Found {len(servers)} servers", flush=True)
+    if not servers:
+        print("❌ No servers configured. Exiting.", flush=True)
+        return
+    
+    print(f"✅ Server list: {[s.get('name', 'Unknown') for s in servers]}", flush=True)
+    
+    # Get last processed date
+    last_processed_dt = await get_last_processed_date()
+    if last_processed_dt:
+        print(f"📅 Last processed match: {last_processed_dt}", flush=True)
+    else:
+        print("📅 No previous matches found. Processing all available matches.", flush=True)
+    
+    # Get already processed match IDs from database
+    processed_match_ids = await get_processed_match_ids()
+    print(f"📊 Already processed: {len(processed_match_ids)} matches", flush=True)
+    
+    # Download and read match files from all servers (run in thread pool to not block event loop)
+    all_json_files = []
+    print(f"\n🌐 Connecting to {len(servers)} server(s) via SFTP...", flush=True)
+    for server in servers:
+        print(f"\n📡 Processing server: {server.get('name', 'Unknown')}", flush=True)
+        print(f"   Host: {server.get('host')}:{server.get('port')}", flush=True)
+        print(f"   User: {server.get('user')}", flush=True)
+        print(f"   Directory: {server.get('dir')}", flush=True)
+        # Run blocking SFTP operations in thread pool to not block Discord heartbeat
+        files = await asyncio.to_thread(download_match_files_from_server, server, last_processed_dt, processed_match_ids)
+        print(f"   ✅ Retrieved {len(files)} new match files", flush=True)
+        all_json_files.extend(files)
+    
+    if not all_json_files:
+        print("\n✓ No new matches to process. Database is up to date.", flush=True)
+        return
+    
+    print(f"\n📁 Total new files to process: {len(all_json_files)}", flush=True)
+    
+    # Process and import matches to database
+    imported_count = await process_match_files(all_json_files)
+    
+    elapsed = time.time() - start_time
+    print(f"\n✓ Compilation complete! Imported {imported_count} matches in {elapsed:.1f}s", flush=True)
+
+
+if __name__ == '__main__':
+    asyncio.run(main())

@@ -7,8 +7,7 @@ from datetime import datetime, timezone, timedelta, time
 import pandas as pd
 from rcon.source import Client
 from requests.exceptions import RequestException
-import mysql.connector
-from mysql.connector import Error
+# MySQL imports removed - now using PostgreSQL via asyncpg
 from googletrans import Translator
 
 # Load environment variables from .env file if it exists
@@ -37,14 +36,17 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.guilds = True  # Required for guild join events
-
 bot = discord.Bot(intents=intents)
 
-# Bot configuration
-BOT_ID = os.getenv('CLIENT_ID')  # Replace this with your bot's client ID
-MAIN_GUILD_ID = 1119055568410251366 # Your main Discord server ID
-ADMIN_ROLE_ID = 1358524106961588495 # Role ID in MAIN_GUILD_ID that grants admin delete privileges for teams
-MY_PERM = 1376625320622297100
+# Guild and Channel Configuration
+# These will be loaded from database during bot initialization
+MAIN_GUILD_ID = None  # Will be set from database
+FIXTURES_CHANNEL_ID = None  # Will be set from database
+RESULTS_CHANNEL_ID = None  # Will be set from database
+ADMIN_ROLE_ID = None  # Will be set from database
+TEAM_LEADER_ID = None  # Will be set from database
+CONFIRMED_SCHEDULE_CHANNEL_ID = None  # Will be set from database
+CAPTAINS_CHANNEL_ID = None  # Will be set from database
 
 # Required permissions for the bot
 REQUIRED_PERMISSIONS = discord.Permissions(
@@ -65,96 +67,18 @@ def get_invite_link():
     client_id = bot.user.id if bot.user else BOT_ID
     return f"https://discord.com/api/oauth2/authorize?client_id={client_id}&permissions={8}&scope=bot%20applications.commands"
 
-
-link = 'https://docs.google.com/spreadsheets/d/1DInBbtsCXE3kBJR2CtLSmdDsE9EP7n1nvI0GqYJ2exY/edit?usp=sharing'
-token = os.getenv('DISCORD_BOT_TOKEN')
-if not token:
-    raise ValueError("DISCORD_BOT_TOKEN environment variable is required but not set")
-
-# Primary Database Info
-host = os.getenv('DB_HOST1', 'db-par-01.apollopanel.com')
-port = int(os.getenv('DB_PORT1', '3306'))
-user = os.getenv('DB_USER1')
-password = os.getenv('DB_PASSWORD1')  
-database = os.getenv('DB_NAME1')
-
-# Secondary Database Info (Failover)
-host2 = os.getenv('DB_HOST2')
-port2 = int(os.getenv('DB_PORT2', '3306'))
-user2 = os.getenv('DB_USER2')
-password2 = os.getenv('DB_PASSWORD2')  
-database2 = os.getenv('DB_NAME2')
-
-# Database Connection Settings
-charset = 'utf8'
-collation = 'utf8_general_ci'
-
-# Track which database is currently active
-current_db_config = {
-    'primary': {
-        'host': host,
-        'port': port,
-        'user': user,
-        'password': password,
-        'database': database
-    },
-    'secondary': {
-        'host': host2,
-        'port': port2,
-        'user': user2,
-        'password': password2,
-        'database': database2
-    }
-}
-
 # Constants
+FIVES_MAIN_MATCHMAKING_CHANNELS = []
 SIXES_MAIN_MATCHMAKING_CHANNELS = []
 EIGHTS_MAIN_MATCHMAKING_CHANNELS = []
+FIVES_POSITIONS = ["GK", "CB", "LM", "RM", "CF"]  # Make sure these are uppercase
 SIXES_POSITIONS = ["GK", "LB", "RB", "CM", "LW", "RW"]  # Make sure these are uppercase
 EIGHTS_POSITIONS = ["GK", "LB", "CB","RB", "CM", "LW", "CF", "RW"]  # Make sure these are uppercase
+FIVES_PLAYERS_NEEDED = 10  # Number of players needed for a full match
 SIXES_PLAYERS_NEEDED = 12  # Number of players needed for a full match
 EIGHTS_PLAYERS_NEEDED = 16  # Number of players needed for a full match
-
-TITLE = "🤖 `CA Community Bot`"
-DESCRIPTION = "I manage the IOSCA community and I work the ratings system."
-HOW_TO_USE = "🤔 How to use me?"
-COMMANDS = "⌨️ Available commands"
-ADD = "🤝 Copyright (c) 2025 **CA Community Bot**\n*THIS SOFTWARE IS PROVIDED WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED.*" 
-FOOTER_TEXT = "If you require further assistance, directly message: @shaq#6096"
-FOOTER_URL = "https://imgur.com/ylgPvo4.jpeg"
-
-USE_MESSAGE = ""
-USE_MESSAGE += f"**1**. Get a feel for the bot by using the different commands. This bot uses your 18-digit unique discord id to tie your account with your rating.\n"
-USE_MESSAGE += f"**2**. If for any case the bot doesn't work for you, even if you have a rating. I'll have to update your discord id.\n"
-USE_MESSAGE += f"**3**. This bot is still a WIP, but we hope to constantly update this to include new commands and added functionality.\n"
-USE_MESSAGE += f"**4**. Let me know if there are any bugs or new features you would like to see changed/added!\n"
-USE_MESSAGE += f"**5**. Enjoy! Or not.\n"
-USE_MESSAGE += "\u200b"
-
-ADD_MESSAGE = ""
-ADD_MESSAGE += ""
-ADD_MESSAGE += "\u200b"
-
-#* Success messages ---------------------------------------------------------------------------------------------
-DELETED_MSG = "Successfully deleted the messages."
-SENT_DM = "DM has been sent!"
-
-# Input errors
-YOUR_ACCOUNT_NOT_FOUND = "We do not have your account in your system. Please contact shaq to fix this."
-ACCOUNT_NOT_FOUND = "That account is not in the system. Please contact shaq to fix this."
-INVALID_PERMISSIONS = "You do not have the permission to do that."
-NON_EXISTENT = "That account is invalid."
-
-# --- Guild & Channel IDs ---
-GUILD_ID = 1119055568410251366 # Main Guild ID (IOSoccer Central America)
-MAIN_GUILD_ID = 1119055568410251366 # Explicitly named for clarity
 
 # Main Matchmaking Channels
 EIGHTS_CHANNEL_REGEX_PATTERN = r"8v8"
 SIXES_CHANNEL_REGEX_PATTERN = r"6v6"
-
-# Channel for announcing started Team vs Team or Team vs Main Guild challenges
-# also to announce when teams are created, deleted, or when bot is invited.
-MAIN_CHALLENGE_ANNOUNCEMENT_CHANNEL_ID = 1119057083988451371
-OTHER_CHALLENGE_ANNOUNCEMENT_CHANNEL_ID = 1119057083988451371
-FIXTURES_CHANNEL_ID = 1382748436285096059
+FIVES_CHANNEL_REGEX_PATTERN = r"5v5"

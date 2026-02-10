@@ -1,5 +1,4 @@
 from ios_bot.config import *
-from ios_bot.database_manager import get_player_by_steam_id, register_player
 
 # SteamID format validation
 steam_id_regex = re.compile(r"^STEAM_[0-1]:[0-1]:\d{1,10}$")
@@ -36,9 +35,10 @@ class SteamIDModal(Modal):
 
         try:
             # Check if the SteamID is already registered to another user
-            existing_player = await get_player_by_steam_id(steam_id)
+            existing_player = await bot.db.players.get_player_by_steam_id(steam_id)
             if (
                 existing_player
+                and existing_player["discord_id"] is not None
                 and existing_player["discord_id"] != interaction.user.id
             ):
                 await interaction.response.send_message(
@@ -48,14 +48,20 @@ class SteamIDModal(Modal):
                 return
 
             # Proceed with registration or update
-            await register_player(
+            success = await bot.db.players.register_player(
                 discord_id=interaction.user.id,
                 username=interaction.user.display_name,
                 steam_id=steam_id,
             )
 
+            if not success:
+                await interaction.response.send_message(
+                    f"Could not register SteamID `{steam_id}` — it may already be linked to another Discord account.",
+                    ephemeral=True,
+                )
+                return
+
             message = f"Thank you {interaction.user.mention}! Your registration has been updated with SteamID `{steam_id}`."
-            # Use followup.send because we have already deferred the response.
             await interaction.response.send_message(message, ephemeral=True)
 
         except Exception as e:

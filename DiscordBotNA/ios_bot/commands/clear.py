@@ -5,8 +5,9 @@ from ios_bot.config import *
 @commands.bot_has_permissions(manage_messages=True)  # for the bot
 
 async def clear(ctx, num: int):
+    await ctx.defer(ephemeral=True)
     await ctx.channel.purge(limit=num)
-    await ctx.respond(DELETED_MSG, ephemeral=True)
+    await ctx.followup.send(DELETED_MSG, ephemeral=True)
 
 @clear.error
 async def clear_error(ctx, error):

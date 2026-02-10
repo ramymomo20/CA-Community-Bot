@@ -1,7 +1,34 @@
 import pandas as pd
 import numpy as np
 import os
+import sys
+import asyncio
 from datetime import datetime
+from pathlib import Path
+
+# Add project root to path
+project_root = Path(__file__).parent.parent.parent.parent
+sys.path.insert(0, str(project_root))
+
+# Import database connection
+from ios_bot.db import Database
+from dotenv import load_dotenv
+
+# Load environment variables
+env_path = project_root / '.env'
+load_dotenv(env_path)
+
+# Initialize database connection
+SUPABASE_DB_URL = os.getenv('SUPABASE_DB_URL')
+db = None
+
+async def init_db():
+    """Initialize database connection"""
+    global db
+    if db is None:
+        db = Database(SUPABASE_DB_URL)
+        await db.initialize()
+    return db
 
 def zscore(s: pd.Series) -> pd.Series:
     """Calculate z-score normalization"""
@@ -11,9 +38,9 @@ def zscore(s: pd.Series) -> pd.Series:
 def map_position(cat: str) -> str:
     """Map position to general category"""
     p = (cat or "").upper()
-    if p in ('LW','CF','RW','ST'):        return 'ATK'
-    if p in ('LM','CM','RM','CAM','CDM'): return 'MID'
-    if p in ('LB','CB','RB','LWB','RWB'):  return 'DEF'
+    if p in ('LW','CF','RW'):        return 'ATK'
+    if p in ('CM'): return 'MID'
+    if p in ('LB','CB','RB'):  return 'DEF'
     if 'GK' in p:                         return 'GK'
     return 'FLX'
 
@@ -21,42 +48,76 @@ def sigmoid(x):
     """Sigmoid function to map z-scores to [0,1]"""
     return 1 / (1 + np.exp(-x))
 
-def generate_player_ratings():
+async def generate_player_ratings():
     """
-    Generate player ratings directly from player_stats.csv
+    Generate player ratings directly from PostgreSQL database
     """
     
-    # Read the original player_stats.csv
-    input_file = "player_stats.csv"
-    if not os.path.exists(input_file):
-        print(f"❌ Error: {input_file} not found!")
-        return False
+    # Initialize database connection
+    await init_db()
+    
+    print(f"📖 Fetching player stats from database...")
+    
+    # Query to get all player match data with team info
+    query = """
+    SELECT 
+        pmd.steam_id as "Steam ID",
+        p.discord_name as "Name",
+        pmd.position as "Position",
+        COALESCE(ms.match_id, ms.id::text, pmd.match_id::text) as match_id,
+        ms.datetime,
+        t.guild_name as "Team Name",
+        pmd.red_cards as "redCards",
+        pmd.yellow_cards as "yellowCards",
+        pmd.fouls,
+        pmd.tackles as "slidingTackles",
+        pmd.sliding_tackles_completed as "slidingTacklesCompleted",
+        pmd.goals_conceded as "goalsConceded",
+        pmd.shots,
+        pmd.shots_on_goal as "shotsOnGoal",
+        pmd.passes_completed as "passesCompleted",
+        pmd.interceptions,
+        pmd.offsides,
+        pmd.goals,
+        pmd.own_goals as "ownGoals",
+        pmd.assists,
+        pmd.passes_attempted as "passes",
+        pmd.keeper_saves as "keeperSaves",
+        pmd.distance_covered as "distanceCovered",
+        pmd.keeper_saves_caught as "keeperSavesCaught",
+        pmd.chances_created as "chancesCreated",
+        pmd.second_assists as "secondAssists",
+        pmd.key_passes as "keyPasses"
+    FROM PLAYER_MATCH_DATA pmd
+    LEFT JOIN MATCH_STATS ms ON pmd.match_id::text = COALESCE(ms.match_id::text, ms.id::text)
+    LEFT JOIN IOSCA_PLAYERS p ON pmd.steam_id = p.steam_id
+    LEFT JOIN IOSCA_TEAMS t ON pmd.guild_id = t.guild_id
+    ORDER BY ms.datetime DESC NULLS LAST
+    """
+    
+    try:
+        rows = await db.pool.fetch(query)
+        if not rows:
+            print("❌ No player match data found in database!")
+            return False
         
-    print(f"📖 Reading {input_file}...")
-    df = pd.read_csv(input_file)
+        # Convert to DataFrame
+        df = pd.DataFrame([dict(row) for row in rows])
+        print(f"� Loaded {len(df)} player match records from database")
+    except Exception as e:
+        print(f"❌ Error fetching data from database: {e}")
+        return False
     
     # Filter out rows where Team Name is 'N/A' (players not in teams)
     df = df[df['Team Name'] != 'N/A'].copy()
     
     print(f"📊 Processing {len(df)} valid player records...")
     
-    # Parse match dates
-    df['matchDate'] = pd.to_datetime(df['datetime'], errors='coerce')
-    df['matchDate'] = df['matchDate'].fillna(pd.Timestamp.today())
+    # No time-based weighting - calculate from ALL matches equally
+    # This allows ratings to be calculated from scratch and updated incrementally
+    df['weight'] = 1.0
     
-    # Compute age in days for weighting
-    max_date = df['matchDate'].max()
-    df['age_days'] = (max_date - df['matchDate']).dt.total_seconds() / 86400
-    
-    # Apply time-based weights
-    span = max_date - df['matchDate'].min()
-    if span < pd.Timedelta(days=7):
-        df['weight'] = 1.0
-    else:
-        λ = 0.1
-        df['weight'] = np.exp(-λ * df['age_days'])
-    
-    # Define stat columns to aggregate
+    # Define stat columns to aggregate (only columns that exist in schema)
     stat_columns = [
         'redCards', 'yellowCards', 'fouls', 'foulsSuffered',
         'slidingTackles', 'slidingTacklesCompleted', 'goalsConceded',
@@ -64,7 +125,7 @@ def generate_player_ratings():
         'offsides', 'goals', 'ownGoals', 'assists', 'passes',
         'freeKicks', 'penalties', 'corners', 'throwIns',
         'keeperSaves', 'goalKicks', 'possession', 'distanceCovered',
-        'keeperSavesCaught', 'chancesCreated', 'secondAssists', 'keyPasses'
+        'keeperSavesCaught', 'keyPasses', 'chancesCreated', 'secondAssists'
     ]
     
     # Ensure all stat columns are numeric
@@ -72,37 +133,22 @@ def generate_player_ratings():
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
     
-    # Prepare aggregation dictionary
-    agg_dict = {}
+    # Simple aggregation - sum all stats from all matches
+    # No time-based weighting for cumulative calculation
     
-    # Weighted sum for raw stats
-    for stat in stat_columns:
-        if stat in df.columns:
-            agg_dict[stat] = lambda s, stat=stat: (s * df.loc[s.index, 'weight']).sum()
-    
-    # Special aggregations
+    # Group by Steam ID and aggregate - sum all stats from all matches
+    print("🔄 Aggregating player statistics from ALL matches...")
+    agg_dict = {stat: 'sum' for stat in stat_columns if stat in df.columns}
     agg_dict.update({
-        "avgPossession": lambda s: np.average(s, weights=df.loc[s.index, 'weight']),
-        "passCompletionPct": lambda s: np.average(
-            (df.loc[s.index, 'passesCompleted'] / df.loc[s.index, 'passes'].replace(0, 1)) * 100,
-            weights=df.loc[s.index, 'weight']
-        ),
-        "appearances": lambda s: df.loc[s.index, 'match_id'].nunique(),
-        "position": lambda s: s.mode().iloc[0] if not s.mode().empty else "",
-        "player": "first",
+        'Name': 'first',
+        'Position': lambda s: s.mode().iloc[0] if not s.mode().empty else "",
+        'match_id': 'nunique'  # Count unique matches
     })
     
-    # Group by Steam ID and aggregate
-    print("🔄 Aggregating player statistics...")
     grouped = (
         df
         .groupby('Steam ID', as_index=False)
-        .agg({
-            **{stat: agg_dict.get(stat, 'sum') for stat in stat_columns if stat in df.columns},
-            'Name': 'first',
-            'Position': lambda s: s.mode().iloc[0] if not s.mode().empty else "",
-            'match_id': 'nunique'  # This will be renamed to appearances
-        })
+        .agg(agg_dict)
     )
     
     # Rename columns for consistency
@@ -126,10 +172,8 @@ def generate_player_ratings():
           grouped["assists"]
         + grouped["secondAssists"]
         + grouped["goals"]
-        + grouped["shotsOnGoal"]
-        + grouped["chancesCreated"]
     )
-    grouped["attackMistakes"] = grouped["shots"] - grouped["shotsOnGoal"]
+    grouped["attackMistakes"] = grouped["shots"] - grouped["shotsOnGoal"] + grouped["offsides"]
     
     grouped["defenseDeeds"] = (
           grouped["interceptions"]
@@ -167,23 +211,23 @@ def generate_player_ratings():
     
     raw_atk = (
         0.65*norm["attackDeeds"] - 0.30*norm["attackMistakes"]
-      + 0.20*norm["assister"] + 0.20*norm["passer"]
-      + 0.05*norm["defenseDeeds"] - 0.15*norm["defenseMistakes"]
-      + 0.05*norm["lapses"] - 0.20*norm["passerMistakes"]
+      + 0.30*norm["assister"] + 0.25*norm["passer"]
+      + 0.15*norm["defenseDeeds"] - 0.10*norm["defenseMistakes"]
+      - 0.25*norm["lapses"] - 0.30*norm["passerMistakes"]
     )
     raw_mid = (
         0.65*norm["assister"] + 0.30*norm["passer"]
-      + 0.20*norm["defenseDeeds"] - 0.20*norm["defenseMistakes"]
-      + 0.05*norm["attackDeeds"] - 0.15*norm["lapses"] - 0.40*norm["passerMistakes"]
+      + 0.25*norm["defenseDeeds"] - 0.30*norm["defenseMistakes"]
+      + 0.15*norm["attackDeeds"] - 0.20*norm["lapses"] - 0.40*norm["passerMistakes"]
     )
     raw_def = (
         0.65*norm["defenseDeeds"] - 0.40*norm["defenseMistakes"]
-      + 0.25*norm["passer"] + 0.20*norm["assister"]
-      + 0.20*norm["attackDeeds"] - 0.30*norm["passerMistakes"]
+      + 0.30*norm["passer"] + 0.30*norm["assister"]
+      + 0.25*norm["attackDeeds"] - 0.20*norm["passerMistakes"]
     )
     raw_gk = (
-        0.60*norm["keeperDeeds"] - 0.35*norm["keeperMistakes"]
-      + 0.25*norm["passer"] + 0.20*norm["assister"] + 0.15*norm["lapses"]
+        0.65*norm["keeperDeeds"] - 0.30*norm["keeperMistakes"]
+      + 0.35*norm["passer"] + 0.35*norm["assister"] - 0.15*norm["lapses"]
       - 0.50*norm["passerMistakes"]
     )
     
@@ -202,7 +246,7 @@ def generate_player_ratings():
     print("⚖️ Applying penalties and adjustments...")
     
     γ = 0.5
-    pos_factor = {"ATK": 0.8, "MID": 1.0, "DEF": 1.2, "GK": 1.5}
+    pos_factor = {"ATK": 1.5, "MID": 1.5, "DEF": 1.0, "GK": 1.0}
     pen_base = 1 - np.exp(-γ * grouped["lapses"])
     grouped["mistakePenalty"] = pen_base * grouped["generalPosition"].map(pos_factor)
     
@@ -237,8 +281,7 @@ def generate_player_ratings():
     
     final_output = grouped[output_columns].copy()
     
-    # Save results
-    # Save in the same directory as this script (Rating_Generator folder)
+    # Save results to CSV
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output_file = os.path.join(script_dir, "final_ratings.csv")
     final_output.to_csv(output_file, index=False)
@@ -246,39 +289,35 @@ def generate_player_ratings():
     print(f"✅ Successfully generated ratings for {len(final_output)} players")
     print(f"📊 Saved to: {output_file}")
     
-    # Show statistics
-    #print("\n📈 Rating Distribution:")
-    #print(f"   Average Rating: {final_output['finalRating'].mean():.2f}")
-    #print(f"   Highest Rating: {final_output['finalRating'].max():.2f}")
-    #print(f"   Lowest Rating: {final_output['finalRating'].min():.2f}")
-    
-    #print("\n🎯 By Position:")
-    # for pos in sorted(final_output['position'].unique()):
-    #     pos_data = final_output[final_output['position'] == pos]
-    #     print(f"   {pos}: {len(pos_data)} players, avg {pos_data['finalRating'].mean():.2f}")
-    
-    # print("\n🏆 Top 10 Players:")
-    # top_players = final_output.nlargest(10, 'finalRating')[['player', 'position', 'finalRating', 'appearances']]
-    # for _, player in top_players.iterrows():
-    #     print(f"   {player['player']} ({player['position']}) - {player['finalRating']} ({player['appearances']} apps)")
-    
+    # Update ratings in database
+    print("💾 Updating ratings in database...")
+    try:
+        for _, row in final_output.iterrows():
+            await db.pool.execute(
+                """
+                UPDATE IOSCA_PLAYERS 
+                SET rating = $1 
+                WHERE steam_id = $2
+                """,
+                float(row['finalRating']),
+                str(row['steamid'])
+            )
+        print(f"✅ Updated {len(final_output)} player ratings in database")
+    except Exception as e:
+        print(f"⚠️ Error updating database: {e}")
     return True
 
-def main():
+async def main():
     """
     Main function to generate player ratings
     """
     print("🚀 Starting Player Rating Generation")
     
-    if not generate_player_ratings():
+    if not await generate_player_ratings():
         print("❌ Failed to generate ratings")
         return
     
     print("🎉 Player rating generation completed successfully!")
 
 if __name__ == "__main__":
-    # Set up paths - script is in Rating Generator, data is in parent ratings directory
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    ratings_dir = os.path.dirname(script_dir)  # Go up one level from Rating Generator to ratings
-    os.chdir(ratings_dir)  # Change to ratings directory to find player_stats.csv
-    main() 
+    asyncio.run(main())

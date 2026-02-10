@@ -1,6 +1,4 @@
 from ios_bot.config import *
-from ios_bot.database_manager import get_player_by_discord_id, get_player_teams
-import csv
 import os
 import io
 from PIL import Image, ImageDraw, ImageFont
@@ -45,8 +43,8 @@ class PlayerStatsView(discord.ui.View):
             self.pages.append("mix")
         if self.total_appearances > 0:  # Only show weekly if player has stats
             self.pages.append("weekly")
-        
-    def create_club_stats_embed(self):
+    
+    async def create_club_stats_embed(self):
         """Create the detailed club team stats embed (Page 2)"""
         is_captain = self.club_team_info and self.club_team_info.get('captain_id') == self.user.id
         color = discord.Color.gold() if is_captain else discord.Color.blue()
@@ -67,8 +65,6 @@ class PlayerStatsView(discord.ui.View):
             is_vice_captain = self.club_team_info.get('vice_captain_id') == self.user.id
             if is_captain:
                 role_text = " (CAPTAIN)"
-            elif is_vice_captain:
-                role_text = " (VICE CAPTAIN)"
             else:
                 role_text = ""
             embed.add_field(name="**Team**", value=f"`{team_name}`{role_text}", inline=True)
@@ -154,7 +150,7 @@ class PlayerStatsView(discord.ui.View):
         embed.set_footer(text="Page 2/3 - Club Team Stats • Use buttons to navigate")
         return embed
     
-    def create_all_time_stats_embed(self):
+    async def create_all_time_stats_embed(self):
         """Create the all-time stats embed (Page 1)"""
         is_captain_of_any_team = any(team.get('captain_id') == self.user.id for team in [self.club_team_info, self.national_team_info] if team)
         color = discord.Color.gold() if is_captain_of_any_team else discord.Color.blue()
@@ -247,7 +243,7 @@ class PlayerStatsView(discord.ui.View):
         return embed
 
 
-    def create_mix_team_stats_embed(self):
+    async def create_mix_team_stats_embed(self):
         """Create the detailed mix team stats embed"""
         is_captain = self.mix_team_info and self.mix_team_info.get('captain_id') == self.user.id
         color = discord.Color.green() if is_captain else discord.Color.orange()
@@ -268,8 +264,6 @@ class PlayerStatsView(discord.ui.View):
             is_vice_captain = self.mix_team_info.get('vice_captain_id') == self.user.id
             if is_captain:
                 role_text = " (CAPTAIN)"
-            elif is_vice_captain:
-                role_text = " (VICE CAPTAIN)"
             else:
                 role_text = ""
             embed.add_field(name="**Team**", value=f"`{team_name}`{role_text}", inline=True)
@@ -346,7 +340,7 @@ class PlayerStatsView(discord.ui.View):
         
         return embed
         
-    def create_national_team_stats_embed(self):
+    async def create_national_team_stats_embed(self):
         """Create the detailed national team stats embed"""
         is_captain = self.national_team_info and self.national_team_info.get('captain_id') == self.user.id
         color = discord.Color.red() if is_captain else discord.Color.dark_red()
@@ -364,11 +358,8 @@ class PlayerStatsView(discord.ui.View):
         
         if self.national_team_info:
             team_name = self.national_team_info.get('name') or self.national_team_info.get('guild_name', 'Unknown Team')
-            is_vice_captain = self.national_team_info.get('vice_captain_id') == self.user.id
             if is_captain:
                 role_text = " (CAPTAIN)"
-            elif is_vice_captain:
-                role_text = " (VICE CAPTAIN)"
             else:
                 role_text = ""
             embed.add_field(name="**Team**", value=f"`{team_name}`{role_text}", inline=True)
@@ -445,7 +436,7 @@ class PlayerStatsView(discord.ui.View):
         
         return embed
         
-    def create_weekly_breakdown_embed(self):
+    async def create_weekly_breakdown_embed(self):
         """Create the weekly breakdown embed (Page 3) - placeholder for now"""
         is_captain_of_any_team = any(team.get('captain_id') == self.user.id for team in [self.club_team_info, self.national_team_info] if team)
         color = discord.Color.gold() if is_captain_of_any_team else discord.Color.blue()
@@ -491,11 +482,11 @@ class PlayerStatsView(discord.ui.View):
         
         # Get the appropriate embed
         if self.current_page == 0:
-            embed = self.create_all_time_stats_embed()
+            embed = await self.create_all_time_stats_embed()
         elif self.current_page == 1:
-            embed = self.create_club_stats_embed()
+            embed = await self.create_club_stats_embed()
         else:  # self.current_page == 2
-            embed = self.create_weekly_breakdown_embed()
+            embed = await self.create_weekly_breakdown_embed()
             
         await interaction.response.edit_message(embed=embed, view=self)
 
@@ -525,69 +516,185 @@ class PlayerStatsView(discord.ui.View):
             # Log any other errors but don't crash
             print(f"Error during timeout cleanup: {e}")
 
-# Define the path to the stats CSV file
-STATS_FILE_PATH = os.path.join(os.path.dirname(__file__), '..', 'ratings', 'player_stats.csv')
+# Stats are now read from database instead of CSV
 BRONZE_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), '..', 'ratings', 'player card', 'bronze.png')
 SILVER_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), '..', 'ratings', 'player card', 'silver.png')
 GOLD_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), '..', 'ratings', 'player card', 'gold.png')
-RATINGS_FILE_PATH = os.path.join(os.path.dirname(__file__), '..', 'ratings', 'Rating_Generator', 'final_ratings.csv')
 
-def get_player_rating(steam_id):
-    """Get player rating from final_ratings.csv by steam_id."""
-    if not os.path.exists(RATINGS_FILE_PATH):
-        print(f"Ratings file not found at: {RATINGS_FILE_PATH}")
-        # Try to create the directory structure and file if they don't exist
-        try:
-            os.makedirs(os.path.dirname(RATINGS_FILE_PATH), exist_ok=True)
-            print(f"Created directory structure for ratings file")
-            
-            # Create an empty CSV file with headers
-            with open(RATINGS_FILE_PATH, 'w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(['steamid', 'finalRating'])
-            print(f"Created empty ratings file at: {RATINGS_FILE_PATH}")
-        except Exception as e:
-            print(f"Could not create ratings file: {e}")
-        return None
-    
+async def get_player_rating(steam_id):
+    """Get player rating from IOSCA_PLAYERS.rating by steam_id."""
     try:
-        with open(RATINGS_FILE_PATH, 'r', newline='', encoding='utf-8') as csvfile:
-            reader = csv.DictReader(csvfile)
-            for row in reader:
-                if row['steamid'] == steam_id:
-                    # Check if finalRating is not empty
-                    if row['finalRating'] and row['finalRating'].strip():
-                        return float(row['finalRating'])
-                    else:
-                        return None
+        row = await bot.db.pool.fetchrow(
+            "SELECT rating FROM IOSCA_PLAYERS WHERE steam_id = $1",
+            steam_id
+        )
+        if row and row.get("rating") is not None:
+            return float(row["rating"])
         return None
-    except (IOError, csv.Error, ValueError) as e:
-        print(f"Error reading ratings file: {e}")
+    except Exception as e:
+        print(f"Error reading player rating from database: {e}")
         return None
 
-def get_player_stats_from_csv(steam_id):
-    """Reads the player_stats.csv and returns all rows matching the steam_id."""
-    
-    if not os.path.exists(STATS_FILE_PATH):
-        print(f"Stats file not found at: {STATS_FILE_PATH}")
-        return None, [], 0
-
+async def get_player_stats_from_db(steam_id):
+    """Get player stats from database by steam_id."""
     try:
-        with open(STATS_FILE_PATH, 'r', newline='', encoding='utf-8') as csvfile:
-            reader = csv.reader(csvfile)
-            header = next(reader)
-            
-            # Print first few rows to see Steam ID format
-            player_rows = []
-            unique_matches = set()
-            for i, row in enumerate(reader):
-                if row and row[2] == steam_id:
-                    player_rows.append(dict(zip(header, row)))
-                    unique_matches.add(row[0])
+        # Query all player match data for this steam_id
+        query = """
+        SELECT 
+            pmd.match_id,
+            ms.datetime,
+            pmd.steam_id,
+            p.discord_name as name,
+            CASE 
+                WHEN pmd.guild_id = ms.home_guild_id THEN ht.guild_name
+                WHEN pmd.guild_id = ms.away_guild_id THEN at.guild_name
+                ELSE 'Unknown'
+            END as team_name,
+            CASE 
+                WHEN pmd.guild_id = ms.home_guild_id THEN at.guild_name
+                WHEN pmd.guild_id = ms.away_guild_id THEN ht.guild_name
+                ELSE 'Unknown'
+            END as opponent_team_name,
+            CASE 
+                WHEN pmd.guild_id = ms.home_guild_id THEN 'home'
+                WHEN pmd.guild_id = ms.away_guild_id THEN 'away'
+                ELSE 'unknown'
+            END as team_side,
+            pmd.position,
+            pmd.passes_completed,
+            pmd.passes_attempted,
+            pmd.shots,
+            pmd.shots_on_goal,
+            pmd.offsides,
+            pmd.corners,
+            pmd.throw_ins,
+            pmd.goal_kicks,
+            pmd.own_goals,
+            pmd.distance_covered,
+            pmd.pass_accuracy,
+            pmd.possession,
+            pmd.free_kicks,
+            pmd.penalties,
+            pmd.goals,
+            pmd.assists,
+            pmd.second_assists,
+            pmd.chances_created,
+            pmd.key_passes,
+            pmd.interceptions,
+            pmd.tackles,
+            pmd.sliding_tackles_completed,
+            pmd.fouls,
+            pmd.fouls_suffered,
+            pmd.keeper_saves,
+            pmd.keeper_saves_caught,
+            pmd.goals_conceded,
+            pmd.yellow_cards,
+            pmd.red_cards
+        FROM PLAYER_MATCH_DATA pmd
+        LEFT JOIN MATCH_STATS ms ON pmd.match_id = ms.match_id
+        LEFT JOIN IOSCA_PLAYERS p ON pmd.steam_id = p.steam_id
+        LEFT JOIN IOSCA_TEAMS ht ON ms.home_guild_id = ht.guild_id
+        LEFT JOIN IOSCA_TEAMS at ON ms.away_guild_id = at.guild_id
+        WHERE pmd.steam_id = $1
+        ORDER BY ms.datetime DESC
+        """
+        
+        rows = await bot.db.pool.fetch(query, steam_id)
+        
+        if not rows:
+            return None, [], 0
+        
+        # Convert to list format matching old CSV structure
+        header = ['match_id', 'datetime', 'Steam ID', 'Name', 'Team Name', 'Opponent Team Name', 
+                  'Team Side', 'Position', 'passes_completed', 'passes_attempted', 'shots', 'shots_on_goal', 
+                  'offsides', 'corners', 'throw_ins', 'goal_kicks', 'own_goals', 'distance_covered', 'pass_accuracy', 
+                  'possession', 'free_kicks', 'penalties', 'goals', 'assists', 'second_assists', 'chances_created',
+                  'key_passes', 'interceptions', 'tackles', 'sliding_tackles_completed', 'fouls', 'fouls_suffered',
+                  'keeper_saves', 'keeper_saves_caught', 'goals_conceded', 'yellow_cards', 'red_cards']
+        
+        player_rows = []
+        unique_matches = set()
 
-            return header, player_rows, len(unique_matches)
-    except (IOError, csv.Error, StopIteration) as e:
-        print(f"Error reading or parsing stats file: {e}")
+        for row in rows:
+            # Build a dict per-row keyed by the header so callers can use row.get(...)
+            values = [
+                str(row['match_id']),
+                row['datetime'].strftime('%Y-%m-%d %H:%M:%S') if row['datetime'] else '',
+                row['steam_id'] or '',
+                row['name'] or 'Unknown',
+                row['team_name'] or 'Unknown',
+                row['opponent_team_name'] or 'Unknown',
+                row['team_side'] or 'unknown',
+                row['position'] or '',
+                str(row['passes_completed'] or 0),
+                str(row['passes_attempted'] or 0),
+                str(row['shots'] or 0),
+                str(row['shots_on_goal'] or 0),
+                str(row['offsides'] or 0),
+                str(row['corners'] or 0),
+                str(row['throw_ins'] or 0),
+                str(row['goal_kicks'] or 0),
+                str(row['own_goals'] or 0),
+                str(row['distance_covered'] or 0),
+                str(row['pass_accuracy'] or 0),
+                str(row['possession'] or 0),
+                str(row['free_kicks'] or 0),
+                str(row['penalties'] or 0),
+                str(row['goals'] or 0),
+                str(row['assists'] or 0),
+                str(row['second_assists'] or 0),
+                str(row['chances_created'] or 0),
+                str(row['key_passes'] or 0),
+                str(row['interceptions'] or 0),
+                str(row['tackles'] or 0),
+                str(row['sliding_tackles_completed'] or 0),
+                str(row['fouls'] or 0),
+                str(row['fouls_suffered'] or 0),
+                str(row['keeper_saves'] or 0),
+                str(row['keeper_saves_caught'] or 0),
+                str(row['goals_conceded'] or 0),
+                str(row['yellow_cards'] or 0),
+                str(row['red_cards'] or 0)
+            ]
+
+            # Map header -> value so existing code using row.get(...) works
+            row_dict = {header[i]: values[i] for i in range(min(len(header), len(values)))}
+
+            # Add camelCase aliases expected by the stats display/aggregation code
+            alias_map = {
+                "passes_completed": "passesCompleted",
+                "passes_attempted": "passes",
+                "shots_on_goal": "shotsOnGoal",
+                "second_assists": "secondAssists",
+                "chances_created": "chancesCreated",
+                "key_passes": "keyPasses",
+                "sliding_tackles_completed": "slidingTacklesCompleted",
+                "fouls_suffered": "foulsSuffered",
+                "keeper_saves": "keeperSaves",
+                "keeper_saves_caught": "keeperSavesCaught",
+                "goals_conceded": "goalsConceded",
+                "yellow_cards": "yellowCards",
+                "red_cards": "redCards",
+                "own_goals": "ownGoals",
+                "distance_covered": "distanceCovered",
+                "free_kicks": "freeKicks",
+                "goal_kicks": "goalKicks",
+                "pass_accuracy": "passAccuracy",
+                "tackles": "slidingTackles",
+                "throw_ins": "throwIns"
+            }
+            for source_key, dest_key in alias_map.items():
+                if source_key in row_dict and dest_key not in row_dict:
+                    row_dict[dest_key] = row_dict[source_key]
+            player_rows.append(row_dict)
+
+            # Track unique match ids (use original value for accuracy)
+            unique_matches.add(row['match_id'])
+        
+        return header, player_rows, len(unique_matches)
+        
+    except Exception as e:
+        print(f"Error reading player stats from database: {e}")
         return None, [], 0
 
 def calculate_all_time_stats(player_stats_rows):
@@ -743,7 +850,7 @@ async def generate_player_card(user, club_team_info, national_team_info, team_po
     try:
         # Load the template image and determine rating display
         
-        # Use actual player rating from final_ratings.csv if available
+        # Use actual player rating from the database if available
         if player_rating is not None:
             # Convert from rating scale to display scale for the card
             # Scale the rating: multiply by 10 for display (5.0 -> 50, 10.0 -> 100)
@@ -897,46 +1004,23 @@ async def view_player(interaction: discord.Interaction, user: discord.Member):
     """Shows a player card with their teams and stats."""
     await view_player_logic(interaction, user)
 
-@bot.slash_command(name="player_stats", description="View a player's stats and teams (alternative command).")
-async def player_stats(interaction: discord.Interaction, username: str):
-    """Alternative command that takes a username string instead of Member object."""
-    await interaction.response.defer()
-    
-    # Try to find the user by username
-    guild = interaction.guild
-    if not guild:
-        await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
+
+@bot.message_command(name="View Player", name_localizations={"en-US": "View Player", "es-ES": "Ver jugador"})
+async def view_player_message(ctx, message: discord.Message):
+    """Context menu (right-click message) -> view the player who posted the message."""
+    # Use the message author as the target user
+    if not message or not message.author:
+        await ctx.respond("Could not determine message author.", ephemeral=True)
         return
-    
-    # Remove @ if present
-    username = username.strip().lstrip('@')
-    
-    # Try to find the member
-    member = None
-    try:
-        # First try exact match
-        member = guild.get_member_named(username)
-        if not member:
-            # Try case-insensitive search
-            for guild_member in guild.members:
-                if guild_member.name.lower() == username.lower() or guild_member.display_name.lower() == username.lower():
-                    member = guild_member
-                    break
-    except Exception as e:
-        print(f"Error finding member: {e}")
-    
-    if not member:
-        await interaction.followup.send(f"Could not find a user named '{username}' in this server.", ephemeral=True)
-        return
-    
-    await view_player_logic(interaction, member)
+
+    await view_player_logic(ctx, message.author)
 
 async def view_player_logic(interaction: discord.Interaction, user: discord.Member):
     """Shows a player card with their teams and stats."""
     await interaction.response.defer()
 
     # 1. Get Player's SteamID from our own DB
-    player_record = await get_player_by_discord_id(user.id)
+    player_record = await bot.db.players.get_player_by_discord_id(str(user.id))
     if not player_record or not player_record.get('steam_id'):
         await interaction.followup.send(
             f"{user.mention} has not registered their SteamID. They can do so using `/player_register`.",
@@ -946,10 +1030,10 @@ async def view_player_logic(interaction: discord.Interaction, user: discord.Memb
 
     steam_id = player_record['steam_id']
 
-    # 2. Get Player's Stats from CSV, Teams from DB, and Rating
-    header, player_stats_rows, total_appearances = get_player_stats_from_csv(steam_id)
-    player_teams = await get_player_teams(user.id)
-    player_rating = get_player_rating(steam_id)
+    # 2. Get Player's Stats from Database, Teams, and Rating
+    header, player_stats_rows, total_appearances = await get_player_stats_from_db(steam_id)
+    player_teams = await bot.db.teams.get_player_teams(str(user.id))
+    player_rating = await get_player_rating(steam_id)
 
     # Exit if player has no teams and no stats to show
     if not player_teams and not player_stats_rows:
@@ -1038,8 +1122,8 @@ async def view_player_logic(interaction: discord.Interaction, user: discord.Memb
         steam_id=steam_id
     )
     
-    # Start with the first page (Club Team Stats)
-    embed = view.create_all_time_stats_embed()
+    # Start with the first page (All-Time Stats)
+    embed = await view.create_all_time_stats_embed()
     message = await interaction.followup.send(embed=embed, view=view)
     
     # Store the message reference in the view for timeout cleanup

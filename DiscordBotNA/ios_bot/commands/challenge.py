@@ -1,9 +1,10 @@
 from ios_bot.config import *
+import ios_bot.config as config_module
 import time as clock
-from ios_bot.database_manager import get_team, get_all_teams_with_channels
 from ios_bot.signup_manager import get_channel_state, init_state, format_lineup, refresh_lineup as sm_refresh_lineup, get_channel_context # MODIFIED
 from ios_bot.challenge_manager import active_challenges, broadcast_challenge_cooldowns
 from datetime import datetime
+from ios_bot.semaphores import challenge_semaphore
 
 # --- Helper function to check if a team's lineup is full --- #
 def is_lineup_full(state: dict, context_type: str) -> bool:
@@ -16,6 +17,8 @@ def is_lineup_full(state: dict, context_type: str) -> bool:
         positions_to_check = EIGHTS_POSITIONS
     elif context_type == "team_6s":
         positions_to_check = SIXES_POSITIONS
+    elif context_type == "team_5s":
+        positions_to_check = FIVES_POSITIONS
     else:
         return False
 
@@ -47,13 +50,13 @@ def is_main_channel_challenged(main_channel_id: int) -> tuple[bool, str]:
     # Check active challenges
     for ch_id, ch_data in active_challenges.items():
         # Check if this channel is the opponent in an accepted challenge
-        if (ch_data.get("opponent_guild_id") == MAIN_GUILD_ID and 
+        if (ch_data.get("opponent_guild_id") == config_module.MAIN_GUILD_ID and 
             ch_data.get("opponent_channel_id") == main_channel_id and 
             ch_data.get("status") == "accepted"):
             return True, ch_data.get("initiating_team_name", "another team")
         
         # Check if this channel is the target of a pending challenge
-        if (ch_data.get("target_id") == MAIN_GUILD_ID and 
+        if (ch_data.get("target_id") == config_module.MAIN_GUILD_ID and 
             ch_data.get("target_channel_id_for_main", 0) == main_channel_id and 
             ch_data.get("status") == "pending_direct"):
             return True, ch_data.get("initiating_team_name", "another team")
@@ -134,7 +137,7 @@ class ChallengeAcceptView(View):
         challenge_data["opponent_guild_id"] = interaction.guild_id
         challenge_data["opponent_channel_id"] = interaction.channel_id
         
-        accepting_team_details = await get_team(interaction.guild_id)
+        accepting_team_details = await bot.db.teams.get_team(interaction.guild_id)
         if not accepting_team_details: # DB error check
             await interaction.followup.send("Error: Could not retrieve your team's details to accept the challenge. Please try again.", ephemeral=False)
             # Revert status if possible, or clear interaction
@@ -261,8 +264,8 @@ class ChallengeView(View):
 
         # Only show options for the current game type
         options = [
-            SelectOption(label=f"Broadcast to all {self.game_type.upper()} Teams", value="broadcast_all", description=f"Challenge any available registered {self.game_type.upper()} team."),
-            SelectOption(label=f"Challenge Main {self.game_type.upper()} Channel", value=f"main_channel_{self.game_type}", description=f"Challenge the main guild's {self.game_type.upper()} matchmaking channel.")
+            SelectOption(label=f"Broadcast to all {self.game_type.upper()} Teams", value="broadcast_all", description=f"Challenge any available registered team."),
+            SelectOption(label=f"Challenge Main {self.game_type.upper()} Channel", value=f"main_channel_{self.game_type}", description=f"Challenge the main guild's matchmaking channel.")
         ]
         self.target_type_select = Select(placeholder=f"Choose challenge target type for {self.game_type.upper()}...", options=options, custom_id="challenge_target_type")
         self.target_type_select.callback = self.on_target_type_selected
@@ -291,7 +294,13 @@ class ChallengeView(View):
             await interaction.edit_original_response(content=f"You've selected to broadcast the {self.game_type.upper()} challenge.", view=self)
         elif chosen_type_value.startswith("main_channel_"):
             self.selected_target_type = "main_channel"
-            main_channels_ids = EIGHTS_MAIN_MATCHMAKING_CHANNELS if self.game_type == "8s" else SIXES_MAIN_MATCHMAKING_CHANNELS
+            main_channels_ids = (
+                config_module.EIGHTS_MAIN_MATCHMAKING_CHANNELS
+                if self.game_type == "8s"
+                else config_module.SIXES_MAIN_MATCHMAKING_CHANNELS
+                if self.game_type == "6s"
+                else config_module.FIVES_MAIN_MATCHMAKING_CHANNELS
+            )
             if not main_channels_ids:
                 await interaction.edit_original_response(content=f"❌ Error: No main channels configured for {self.game_type.upper()}.", view=None)
                 return
@@ -400,7 +409,7 @@ class ChallengeView(View):
             # Update cooldown timestamp after successful broadcast
             broadcast_challenge_cooldowns[initiating_team_id] = clock.time()
 
-        initiating_team_details = await get_team(self.initiating_team_id)
+        initiating_team_details = await bot.db.teams.get_team(self.initiating_team_id)
         if not initiating_team_details:
             await interaction.followup.send("Error: Could not retrieve your team data.", ephemeral=True)
             return
@@ -464,7 +473,7 @@ class ChallengeView(View):
 
         if self.selected_target_type == "broadcast":
             new_challenge_data["status"] = "pending_broadcast"
-            all_teams = await get_all_teams_with_channels()
+            all_teams = await bot.db.teams.get_all_teams_with_channels()
             broadcast_count = 0
             challenge_embed = Embed(
                 title=f"Open {self.game_type.upper()} Challenge!",
@@ -489,6 +498,8 @@ class ChallengeView(View):
                     team_channels = team_data.get("eights_channels", [])
                 elif self.game_type == "6s":
                     team_channels = team_data.get("sixes_channels", [])
+                elif self.game_type == "5s":
+                    team_channels = team_data.get("fives_channels", [])
                 else:
                     team_channels = []
 
@@ -522,6 +533,60 @@ class ChallengeView(View):
             else:
                 final_followup_message = "ℹ️ No eligible teams found for broadcast (they might be in active challenges or have no suitable channels)."
                 # No need to add to active_challenges if not sent anywhere
+
+        elif self.selected_target_type == "team":
+            target_team = await bot.db.teams.get_team(self.selected_target_id)
+            if not target_team:
+                await interaction.followup.send("Error: Could not retrieve target team data.", ephemeral=False)
+                return
+
+            if self.game_type == "8s":
+                target_channels = target_team.get("eights_channels", [])
+            elif self.game_type == "6s":
+                target_channels = target_team.get("sixes_channels", [])
+            elif self.game_type == "5s":
+                target_channels = target_team.get("fives_channels", [])
+            else:
+                target_channels = []
+
+            if not target_channels:
+                await interaction.followup.send(
+                    f"Error: Target team has no registered {self.game_type.upper()} matchmaking channel.",
+                    ephemeral=False
+                )
+                return
+
+            target_channel_id = target_channels[0]
+            target_channel_obj = bot.get_channel(target_channel_id)
+            if not target_channel_obj:
+                await interaction.followup.send("Error: Could not find target team matchmaking channel.", ephemeral=False)
+                return
+
+            new_challenge_data["status"] = "pending_direct"
+            new_challenge_data["opponent_guild_id"] = self.selected_target_id
+            new_challenge_data["opponent_channel_id"] = target_channel_id
+            new_challenge_data["opponent_team_name"] = target_team.get("guild_name", "Opponent")
+            active_challenges[challenge_id] = new_challenge_data
+
+            challenge_embed = Embed(
+                title=f"{self.game_type.upper()} Challenge Received",
+                description=f"Team **{initiating_team_name}** has challenged your team to a {self.game_type.upper()} match.",
+                color=discord.Color.orange()
+            )
+            challenge_embed.set_footer(text=f"Challenge ID: {challenge_id}.")
+
+            await target_channel_obj.send(
+                content=f"Attention Captains/VCs of **{target_team.get('guild_name', 'Unknown Team')}**!",
+                embed=challenge_embed,
+                view=view_for_target
+            )
+
+            if initiating_channel_obj:
+                await initiating_channel_obj.send(
+                    f"⚔️ Challenge sent to **{target_team.get('guild_name', 'Unknown Team')}** in {target_channel_obj.mention}."
+                )
+
+            final_followup_message = f"✅ Challenge issued to **{target_team.get('guild_name', 'Unknown Team')}**."
         
         elif self.selected_target_type == "main_channel":
             main_channel_id = self.selected_target_id
@@ -537,7 +602,7 @@ class ChallengeView(View):
             is_challenged, challenger_name = is_main_channel_challenged(main_channel_id)
             
             # Also check the channel state for any lingering challenge flags
-            main_channel_state = await init_state(MAIN_GUILD_ID, main_channel_id)
+            main_channel_state = await init_state(config_module.MAIN_GUILD_ID, main_channel_id)
             if not main_channel_state:
                 await interaction.followup.send(f"Error initializing state for main channel {main_channel_obj.mention}.", ephemeral=False)
                 return
@@ -558,18 +623,11 @@ class ChallengeView(View):
                 return
             
             # For main channel challenges, it's an auto-accept model.
-            # Update main channel state directly.
-            # PRESERVE the existing lineup - just set the challenge flags
-            # The main guild's lineup (teams[0]) should remain intact
-            # Only clear the second team if it exists, as it will be replaced by the challenger
             if len(main_channel_state["teams"]) > 1:
-                main_channel_state["teams"][1] = {p: None for p in (EIGHTS_POSITIONS if self.game_type == "8s" else SIXES_POSITIONS)}
+                main_channel_state["teams"][1] = {p: None for p in (EIGHTS_POSITIONS if self.game_type == "8s" else SIXES_POSITIONS if self.game_type == "6s" else FIVES_POSITIONS)}
             elif len(main_channel_state["teams"]) == 1:
                 # Ensure there's a second team slot for the challenger
-                main_channel_state["teams"].append({p: None for p in (EIGHTS_POSITIONS if self.game_type == "8s" else SIXES_POSITIONS)})
-            
-            # Preserve subs during challenge - don't clear them
-            # Subs will be isolated to their respective channels during the challenge
+                main_channel_state["teams"].append({p: None for p in (EIGHTS_POSITIONS if self.game_type == "8s" else SIXES_POSITIONS if self.game_type == "6s" else FIVES_POSITIONS)})
             
             # Set flags in main channel state for refresh_lineup to use
             main_channel_state["is_challenged_by_team_name"] = initiating_team_name
@@ -577,9 +635,9 @@ class ChallengeView(View):
             
             # Update challenge data
             new_challenge_data["status"] = "accepted" # Auto-accepted by main guild
-            new_challenge_data["opponent_guild_id"] = MAIN_GUILD_ID
+            new_challenge_data["opponent_guild_id"] = config_module.MAIN_GUILD_ID
             new_challenge_data["opponent_channel_id"] = main_channel_id
-            new_challenge_data["opponent_team_name"] = f"Main Guild {self.game_type.upper()} Team" # Placeholder name
+            new_challenge_data["opponent_team_name"] = f"IOSCA" # Placeholder name
             # Store the specific main channel ID that was targeted, as target_id is MAIN_GUILD_ID
             new_challenge_data["target_channel_id_for_main"] = main_channel_id
             active_challenges[challenge_id] = new_challenge_data
@@ -593,7 +651,7 @@ class ChallengeView(View):
             # Refresh main channel's lineup (now VS Initiator) - this should happen AFTER the notification
             await sm_refresh_lineup(main_channel_obj, author_override=interaction.user, force_new_message=True)
 
-            final_followup_message = f"✅ Challenge issued to and auto-accepted by **Main Guild {self.game_type.upper()} Channel** ({main_channel_obj.mention})! Your embeds are updated."
+            final_followup_message = f"✅ Challenge issued to and auto-accepted by **IOSCA Channel** ({main_channel_obj.mention})! Your embeds are updated."
             print(f"[CHALLENGE SUCCESS] Team {initiating_team_name} successfully challenged main channel {main_channel_id}")
 
         else: # Should not be reached if selections are handled
@@ -617,10 +675,10 @@ async def challenge_command(ctx: ApplicationContext):
         await ctx.defer(ephemeral=True)
         # Get the context of the channel the command was used in
         context = await get_channel_context(ctx.guild_id, ctx.channel_id)
-        if context.get("type") not in ["team_6s", "team_8s"]:
-            await ctx.respond("❌ This command must be used from one of your team's registered 6v6 or 8v8 matchmaking channels.", ephemeral=True)
+        if context.get("type") not in ["team_5s", "team_6s", "team_8s"]:
+            await ctx.respond("❌ This command must be used from one of your team's registered 5v5, 6v6, or 8v8 matchmaking channels.", ephemeral=True)
             return
-        game_type = "6s" if context.get("type") == "team_6s" else "8s"
+        game_type = "5s" if context.get("type") == "team_5s" else "6s" if context.get("type") == "team_6s" else "8s"
         view = ChallengeView(author_id=ctx.author.id, initiating_team_id=ctx.guild_id, initiating_channel_id=ctx.channel_id, game_type=game_type)
         await ctx.respond(f"Starting a new {game_type.upper()} challenge... Please select the type of target:", view=view, ephemeral=True)
     except Exception as e:

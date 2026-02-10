@@ -10,8 +10,16 @@ from ios_bot.signup_manager import (
     check_notification_cooldown,
     get_channel_context as sm_get_channel_context
 )
-from ios_bot.database_manager import get_team
 from datetime import datetime, timezone
+
+async def fetch_member_live(guild: discord.Guild, user_id: int):
+    """Fetch a member directly from Discord to avoid cached role data."""
+    if not guild:
+        return None
+    try:
+        return await guild.fetch_member(user_id)
+    except Exception:
+        return None
 
 # Simple rate limiting for highlights
 highlight_rate_limits = {}  # {channel_id: [timestamps]}
@@ -154,14 +162,23 @@ class MoreOptionsView(View):
             self.add_item(view_opponent)
     
     def _has_active_challenge(self) -> bool:
-        """Check if this channel is involved in an active challenge"""
+        """Check if this channel is involved in an active challenge."""
         from ios_bot.challenge_manager import active_challenges
-        
-        for challenge_id, challenge_data in active_challenges.items():
-            if challenge_data.get("status") == "accepted":
-                if (challenge_data.get("initiating_channel_id") == self.channel_id or 
-                    challenge_data.get("opponent_channel_id") == self.channel_id):
-                    return True
+
+        active_statuses = {"accepted", "pending_direct", "pending_broadcast"}
+
+        for challenge_data in active_challenges.values():
+            if challenge_data.get("status") not in active_statuses:
+                continue
+
+            if (challenge_data.get("initiating_channel_id") == self.channel_id or
+                challenge_data.get("opponent_channel_id") == self.channel_id):
+                return True
+
+            broadcast_msgs = challenge_data.get("broadcast_messages") or {}
+            if self.channel_id in broadcast_msgs:
+                return True
+
         return False
 
     async def clear_position_callback(self, interaction: discord.Interaction):
@@ -295,26 +312,38 @@ class MoreOptionsView(View):
         # Find the active challenge for this channel
         from ios_bot.challenge_manager import active_challenges
         from ios_bot.signup_manager import get_channel_state
-        from ios_bot.config import EIGHTS_POSITIONS, SIXES_POSITIONS
+        from ios_bot.config import EIGHTS_POSITIONS, SIXES_POSITIONS, FIVES_POSITIONS
         
         active_challenge_data = None
         is_initiator = False
         
+        active_statuses = {"accepted", "pending_direct", "pending_broadcast"}
         for challenge_data in active_challenges.values():
-            if challenge_data.get("status") == "accepted":
-                if challenge_data.get("initiating_channel_id") == self.channel_id:
-                    active_challenge_data = challenge_data
-                    is_initiator = True
-                    break
-                elif challenge_data.get("opponent_channel_id") == self.channel_id:
-                    active_challenge_data = challenge_data
-                    is_initiator = False
-                    break
+            if challenge_data.get("status") not in active_statuses:
+                continue
+            if challenge_data.get("initiating_channel_id") == self.channel_id:
+                active_challenge_data = challenge_data
+                is_initiator = True
+                break
+            if challenge_data.get("opponent_channel_id") == self.channel_id:
+                active_challenge_data = challenge_data
+                is_initiator = False
+                break
+            broadcast_msgs = challenge_data.get("broadcast_messages") or {}
+            if self.channel_id in broadcast_msgs:
+                active_challenge_data = challenge_data
+                is_initiator = False
+                break
         
         if not active_challenge_data:
             await interaction.followup.send("❌ No active challenge found for this channel.", ephemeral=True)
             return
         
+        # If not accepted yet, opponent lineup may not be available
+        if active_challenge_data.get("status") != "accepted":
+            await interaction.followup.send("❌ Opponent lineup is available after the challenge is accepted.", ephemeral=True)
+            return
+
         # Get opponent's information
         if is_initiator:
             opponent_channel_id = active_challenge_data.get("opponent_channel_id")
@@ -348,8 +377,10 @@ class MoreOptionsView(View):
 
         if len(opponent_lineup) == 8:
             positions = EIGHTS_POSITIONS
-        else:
+        elif len(opponent_lineup) == 6:
             positions = SIXES_POSITIONS
+        elif len(opponent_lineup) == 5:
+            positions = FIVES_POSITIONS
 
         for pos in positions:
             player_data = opponent_lineup.get(pos)
@@ -361,20 +392,27 @@ class MoreOptionsView(View):
         
         # Create embed for opponent's lineup
         embed = discord.Embed(
-            title=f"{opponent_name}'s Current Lineup",
+            title=f"{opponent_name}'s Lineup",
             description=f"```\n{lineup_text}```",
             color=discord.Color.orange()
         )
         
         # Add subs if any
         opponent_subs = opponent_state.get("subs", [])
+        timestamp = datetime.now(timezone.utc).strftime("%I:%M %p")
         if opponent_subs:
             subs_text = ", ".join(sub.display_name if hasattr(sub, 'display_name') else str(sub) for sub in opponent_subs)
             embed.add_field(name="Subs", value=subs_text, inline=False)
         
         # Add game type from challenge data
-        game_type = active_challenge_data.get("game_type", "8s").upper() if len(opponent_lineup) == 8 else active_challenge_data.get("game_type", "6s").upper()
-        embed.set_footer(text=f"Challenge: {game_type}")
+        if len(opponent_lineup) == 8:
+            game_type = active_challenge_data.get("game_type", "8s").upper() 
+        elif len(opponent_lineup) == 6:
+            game_type = active_challenge_data.get("game_type", "6s").upper()
+        elif len(opponent_lineup) == 5:
+            game_type = active_challenge_data.get("game_type", "5s").upper()
+
+        embed.set_footer(text=f"Requested by {interaction.user.name} • {timestamp}")
         
         await interaction.followup.send(embed=embed)
 
@@ -425,17 +463,22 @@ class TeamView(View):
 
     async def sign_callback(self, interaction: Interaction):
         from ios_bot.commands.sign import PositionView, get_channel_context as sign_get_ctx, init_state as sign_init_state
-        
+
         await interaction.response.defer(ephemeral=True)
         guild_id = interaction.guild.id
         channel_id = interaction.channel.id
-        
+
+        # Ensure the channel has an initialized signup state
         state = await sign_init_state(guild_id, channel_id)
         if not state:
             await interaction.followup.send("Error: Could not get channel state for signing.", ephemeral=True)
             return
-            
+
         channel_context = await sign_get_ctx(guild_id, channel_id)
+        if not channel_context:
+            await interaction.followup.send("❌ Could not get channel context for signing.", ephemeral=True)
+            return
+
         view = PositionView(self.team_number, guild_id, channel_id, channel_context.get("type"), state)
         await interaction.followup.send("Select which slot to sign for...", view=view, ephemeral=True)
 

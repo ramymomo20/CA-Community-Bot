@@ -1,8 +1,11 @@
 from ios_bot.config import *
-from .database_manager import get_team
+from ios_bot.db.teams import TeamOperations
+from ios_bot.utils.name_utils import get_display_name
 import multiprocessing
 from datetime import datetime, timezone
 import pytz
+import ios_bot.config as config
+import json
 
 # This dictionary will store the state of each channel's signup.
 # We use a Manager().dict() to ensure it's shared across processes.
@@ -55,22 +58,95 @@ def is_text_player(player) -> bool:
     """Check if a player is a TextPlayer instance"""
     return isinstance(player, TextPlayer)
 
+def _serialize_player(player):
+    """Convert a player object to a JSON-safe dict."""
+    if not player:
+        return None
+    if is_text_player(player):
+        return {
+            "id": None,
+            "name": player.display_name,
+            "is_text": True
+        }
+    return {
+        "id": getattr(player, "id", None),
+        "name": get_display_name(player, max_length=32),
+        "is_text": False
+    }
+
+def serialize_lineup_state(state: dict | None) -> dict:
+    """Serialize lineup state to JSON-safe payload for DB storage."""
+    if not isinstance(state, dict):
+        return {"teams": [], "subs": [], "context_type": None}
+
+    teams_payload = []
+    for team in state.get("teams", []):
+        if not isinstance(team, dict):
+            teams_payload.append({})
+            continue
+        team_payload = {}
+        for pos, player_data in team.items():
+            player = player_data.get("player") if isinstance(player_data, dict) else None
+            team_payload[pos] = _serialize_player(player)
+        teams_payload.append(team_payload)
+
+    subs_payload = []
+    for sub in state.get("subs", []):
+        subs_payload.append(_serialize_player(sub))
+
+    return {
+        "teams": teams_payload,
+        "subs": subs_payload,
+        "context_type": state.get("context_type"),
+    }
+
+def is_lineup_empty(state: dict | None) -> bool:
+    """Return True if all teams and subs are empty."""
+    if not isinstance(state, dict):
+        return True
+    subs = state.get("subs") or []
+    if subs:
+        return False
+    for team in state.get("teams", []):
+        if not isinstance(team, dict):
+            continue
+        for player_data in team.values():
+            if isinstance(player_data, dict) and player_data.get("player") is not None:
+                return False
+    return True
+
+async def persist_lineup_snapshot(guild_id: int, channel_id: int, state: dict | None):
+    """Persist lineup snapshot for a guild/channel if team exists."""
+    try:
+        team_row = await bot.db.teams.get_team(guild_id)
+        if not team_row:
+            return
+        if is_lineup_empty(state):
+            await bot.db.teams.upsert_lineup_snapshot(guild_id, channel_id, state.get("context_type") if state else None, None)
+            return
+        payload = serialize_lineup_state(state)
+        await bot.db.teams.upsert_lineup_snapshot(guild_id, channel_id, state.get("context_type"), payload)
+    except Exception:
+        pass
+
 async def get_channel_context(guild_id: int, channel_id: int) -> dict:
     """
     Determines the matchmaking context of a given channel.
     Returns a dictionary with 'type' and other relevant details.
     """
     # Check Main Guild Channels first
-    if guild_id == MAIN_GUILD_ID:
+    if config.MAIN_GUILD_ID and guild_id == config.MAIN_GUILD_ID:
         # The EIGHTS_MAIN_MATCHMAKING_CHANNELS lists
         # in config.py are now directly populated by the discovery logic at startup.
-        if channel_id in EIGHTS_MAIN_MATCHMAKING_CHANNELS:
+        if channel_id in config.EIGHTS_MAIN_MATCHMAKING_CHANNELS:
             return {"type": "main_8s", "guild_id": guild_id, "channel_id": channel_id}
-        elif channel_id in SIXES_MAIN_MATCHMAKING_CHANNELS:
+        elif channel_id in config.SIXES_MAIN_MATCHMAKING_CHANNELS:
             return {"type": "main_6s", "guild_id": guild_id, "channel_id": channel_id}
+        elif channel_id in config.FIVES_MAIN_MATCHMAKING_CHANNELS:
+            return {"type": "main_5s", "guild_id": guild_id, "channel_id": channel_id}
     
     # Check Registered Team Channels
-    team_data = await get_team(guild_id)
+    team_data = await bot.db.teams.get_team(guild_id)
     if team_data:
         # Ensure team_data is a dictionary
         if not isinstance(team_data, dict):
@@ -97,6 +173,14 @@ async def get_channel_context(guild_id: int, channel_id: int) -> dict:
                 "team_id": guild_id,
                 "team_name": team_data.get('guild_name')
             }
+        elif channel_id in team_data.get('fives_channels', []):
+            return {
+                "type": "team_5s", 
+                "guild_id": guild_id, 
+                "channel_id": channel_id,
+                "team_id": guild_id,
+                "team_name": team_data.get('guild_name')
+            }
             
     return {"type": "not_matchmaking", "guild_id": guild_id, "channel_id": channel_id}
 
@@ -113,6 +197,8 @@ async def init_state(guild_id: int, channel_id: int, force_new: bool = False) ->
         positions = EIGHTS_POSITIONS
     elif context_type in ["main_6s", "team_6s"]:
         positions = SIXES_POSITIONS
+    elif context_type in ["main_5s", "team_5s"]:
+        positions = FIVES_POSITIONS
     else:
         # Should not happen if not_matchmaking is caught
         # print(f"Debug: init_state received unexpected context type {context_type}")
@@ -123,7 +209,7 @@ async def init_state(guild_id: int, channel_id: int, force_new: bool = False) ->
     # and then the entire dict is reassigned to the proxy.
     if force_new or channel_id not in signup_states:
         new_state = {}
-        if context_type in ["main_8s", "main_6s"]:
+        if context_type in ["main_8s", "main_6s", "main_5s"]:
             # Main channels have two teams
             new_state = {
                 "teams": [
@@ -136,7 +222,7 @@ async def init_state(guild_id: int, channel_id: int, force_new: bool = False) ->
                 "context_type": context_type,
                 "guild_id": guild_id
             }
-        elif context_type in ["team_8s", "team_6s"]:
+        elif context_type in ["team_8s", "team_6s", "team_5s"]:
             # Team channels have one team in their state
             new_state = {
                 "teams": [
@@ -214,11 +300,17 @@ class LineupView(View):
             await interaction.response.send_message("❌ This button only works in matchmaking channels.", ephemeral=True)
             return
             
+        # Initialize state to ensure it exists
+        state = await init_state(interaction.guild_id, interaction.channel_id)
+        if not state:
+            await interaction.response.send_message("❌ Error: Could not get channel state for signing.", ephemeral=True)
+            return
+            
         # pop up the PositionView from sign.py
         from ios_bot.commands.sign import PositionView
         await interaction.response.send_message(
             "Select which slot to sign for…",
-            view=PositionView(self.team_idx + 1, interaction.guild_id, interaction.channel_id, channel_context.get("type"), get_channel_state(interaction.channel_id)),
+            view=PositionView(self.team_idx + 1, interaction.guild_id, interaction.channel_id, channel_context.get("type"), state),
             ephemeral=True
         )
 
@@ -240,8 +332,6 @@ async def refresh_lineup(arg, force_new_message: bool = False, author_override: 
     If `force_new_message` is True, old messages are ignored and new ones are sent, updating state.
     `author_override` can be used to specify the user for the footer if `arg` is not a context.
     """
-    # Ensure TeamView is imported locally if it might cause circular imports at module level
-    # from ios_bot.commands.utils import TeamView 
 
     is_ctx = isinstance(arg, discord.ApplicationContext)
     ctx = arg if is_ctx else None
@@ -262,14 +352,26 @@ async def refresh_lineup(arg, force_new_message: bool = False, author_override: 
             print(f"Warning: refresh_lineup called on non-matchmaking channel {channel.id} or state init failed.")
         return
 
+    # Persist lineup snapshot on every refresh (non-empty only).
+    await persist_lineup_snapshot(channel.guild.id, channel.id, state)
+
     context_type = state.get("context_type")
     team_name_from_state = state.get("team_name", "Team") # Used for team_8s title
     challenged_by_team_name = state.get("is_challenged_by_team_name") # Check for main channel challenge state
-    active_challenge_game_type_display = state.get("active_challenge_game_type", "").upper()
-
     embeds_and_views = []
+
+    def _team_has_goalkeeper(team_lineup: dict | None) -> bool:
+        if not isinstance(team_lineup, dict):
+            return False
+        gk_data = team_lineup.get("GK")
+        if not gk_data:
+            return False
+        if isinstance(gk_data, dict):
+            return gk_data.get("player") is not None
+        return True
+
     # If main channel is challenged, only process the first team's embed
-    num_teams_to_display = 1 if context_type in ["main_6s", "main_8s"] and challenged_by_team_name else len(state["teams"])
+    num_teams_to_display = 1 if context_type in ["main_5s", "main_6s", "main_8s"] and challenged_by_team_name else len(state["teams"])
 
     # Access active_challenges for title modification (though direct state flags are now primary)
     from ios_bot.challenge_manager import active_challenges
@@ -280,10 +382,10 @@ async def refresh_lineup(arg, force_new_message: bool = False, author_override: 
         # Determine positions based on context_type (8s)
         if context_type in ["main_6s", "team_6s"]:
             positions = SIXES_POSITIONS
-            game_type_display = "6v6"
         elif context_type in ["main_8s", "team_8s"]:
             positions = EIGHTS_POSITIONS
-            game_type_display = "8v8"
+        elif context_type in ["main_5s", "team_5s"]:
+            positions = FIVES_POSITIONS
 
         desc_parts = []
         for pos in positions:
@@ -313,78 +415,93 @@ async def refresh_lineup(arg, force_new_message: bool = False, author_override: 
                 embed_color = discord.Color.blue()
             elif i == 1: # Team 2
                 embed_color = discord.Color.red()
+        elif context_type == "main_5s":
+            if i == 0: # Team 1
+                embed_color = discord.Color.blue()
+            elif i == 1: # Team 2
+                embed_color = discord.Color.red()
 
-        emb = discord.Embed(title="Lineup", color=embed_color, description=description)
+        emb = discord.Embed(color=embed_color, description=description)
         
 
-        # Set embed author and title based on context
-        my_team_name_for_title = team_name_from_state # Default for team channels
+        # Determine challenge context for VS line and GK status
         opponent_team_name_for_title = None
-        opponent_guild_id_for_thumbnail = None
-
-        # Find the accepted challenge for this channel
+        opponent_has_gk = None
         for ch_data_val in active_challenges.values():
-            if ch_data_val.get("status") == "accepted":
-                if ch_data_val.get("initiating_channel_id") == channel.id:
-                    # This channel is the initiator
-                    opponent_guild_id_for_thumbnail = ch_data_val.get("opponent_guild_id")
-                    break
-                elif ch_data_val.get("opponent_channel_id") == channel.id:
-                    # This channel is the opponent
-                    opponent_guild_id_for_thumbnail = ch_data_val.get("initiating_guild_id")
-                    break
-
-        # If the opponent is the main guild, use MAIN_GUILD_ID
-        if opponent_guild_id_for_thumbnail == MAIN_GUILD_ID:
-            opponent_team_data = await get_team(MAIN_GUILD_ID)
-        else:
-            opponent_team_data = await get_team(opponent_guild_id_for_thumbnail) if opponent_guild_id_for_thumbnail else None
-
-        opponent_icon_url = opponent_team_data['guild_icon'] if opponent_team_data and opponent_team_data.get('guild_icon') else None
-
-        if opponent_icon_url:
-            emb.set_thumbnail(url=opponent_icon_url)
-        else:
-            # fallback to own icon
-            own_team_data = await get_team(channel.guild.id)
-            if own_team_data and own_team_data.get('guild_icon'):
-                emb.set_thumbnail(url=own_team_data['guild_icon'])
+            if ch_data_val.get("status") != "accepted":
+                continue
+            if ch_data_val.get("initiating_channel_id") == channel.id:
+                opponent_team_name_for_title = ch_data_val.get("opponent_team_name")
+                opponent_state = get_channel_state(ch_data_val.get("opponent_channel_id"))
+                if not opponent_state:
+                    try:
+                        opponent_state = await init_state(
+                            ch_data_val.get("opponent_guild_id"),
+                            ch_data_val.get("opponent_channel_id")
+                        )
+                    except Exception:
+                        opponent_state = None
+                if opponent_state and opponent_state.get("teams"):
+                    # Main-guild challenge overlays are rendered from Team 1 (index 0), not the spare Team 2 slot.
+                    opponent_has_gk = _team_has_goalkeeper(opponent_state["teams"][0])
+                break
+            if ch_data_val.get("opponent_channel_id") == channel.id:
+                opponent_team_name_for_title = ch_data_val.get("initiating_team_name")
+                opponent_state = get_channel_state(ch_data_val.get("initiating_channel_id"))
+                if not opponent_state:
+                    try:
+                        opponent_state = await init_state(
+                            ch_data_val.get("initiating_guild_id"),
+                            ch_data_val.get("initiating_channel_id")
+                        )
+                    except Exception:
+                        opponent_state = None
+                if opponent_state and opponent_state.get("teams"):
+                    opponent_has_gk = _team_has_goalkeeper(opponent_state["teams"][0])
+                break
 
         # Set embed title and description for all cases
-        
-                # Set embed title and description for all cases
-        if context_type in ["team_6s", "team_8s"]:
+        if context_type in ["team_5s", "team_6s", "team_8s"]:
             guild_for_icon = bot.get_guild(channel.guild.id)
-            if opponent_team_name_for_title and my_team_name_for_title:
-                emb.title = f"**{my_team_name_for_title}** VS **{opponent_team_name_for_title}** ({game_type_display})"
-                emb.description = f"{description}"
-            else:
-                emb.title = f"{my_team_name_for_title} Lineup ({game_type_display})"
-                emb.description = f"{description}"
+            emb.description = f"{description}"
+            if opponent_team_name_for_title:
+                if opponent_has_gk is None:
+                    emb.description = f"{description}\nvs. {opponent_team_name_for_title}"
+                else:
+                    gk_text = "With GK" if opponent_has_gk else "No GK"
+                    emb.description = f"{description}\nvs. {opponent_team_name_for_title} **{gk_text}**"
             if guild_for_icon and guild_for_icon.icon:
-                emb.set_author(name=guild_for_icon.name, icon_url=guild_for_icon.icon.url)
+                emb.set_author(name="Team List", icon_url=guild_for_icon.icon.url)
+            else:
+                emb.set_author(name="Team List")
                 
-        elif context_type in ["main_6s", "main_8s"]:
-            main_guild_obj = bot.get_guild(MAIN_GUILD_ID)
+        elif context_type in ["main_5s", "main_6s", "main_8s"]:
+            main_guild_obj = bot.get_guild(config.MAIN_GUILD_ID) if config.MAIN_GUILD_ID else None
             main_guild_name = main_guild_obj.name if main_guild_obj else "Main Guild"
             if challenged_by_team_name:
-                emb.title = f"**{main_guild_name} Team** VS **{challenged_by_team_name}** ({active_challenge_game_type_display})"
+                if opponent_has_gk is None:
+                    emb.description = f"{description}\nvs. {challenged_by_team_name}"
+                else:
+                    gk_text = "With GK" if opponent_has_gk else "No GK"
+                    emb.description = f"{description}\nvs. {challenged_by_team_name} **{gk_text}**"
+            elif opponent_team_name_for_title:
+                if opponent_has_gk is None:
+                    emb.description = f"{description}\nvs. {opponent_team_name_for_title}"
+                else:
+                    gk_text = "With GK" if opponent_has_gk else "No GK"
+                    emb.description = f"{description}\nvs. {opponent_team_name_for_title} **{gk_text}**"
+            else:
                 emb.description = f"{description}"
-            elif opponent_team_name_for_title and my_team_name_for_title:
-                emb.title = f"**{my_team_name_for_title}** VS **{opponent_team_name_for_title}** ({game_type_display})"
-                emb.description = f"{description}"
-            elif i == 0:
-                emb.title = f"**{main_guild_name} Team 1** Signup ({game_type_display})"
-                emb.description = f"{description}"
+            if i == 0:
+                if main_guild_obj and main_guild_obj.icon:
+                    emb.set_author(name="Team List", icon_url=main_guild_obj.icon.url)
+                else:
+                    emb.set_author(name="Team List")
             elif i == 1:
-                emb.title = f"**{main_guild_name} Team 2** Signup ({game_type_display})"
-                emb.description = f"{description}"
-            if main_guild_obj and main_guild_obj.icon:
-                emb.set_author(name=main_guild_obj.name, icon_url=main_guild_obj.icon.url)
-        else:
-            # Fallback for unknown context
-            emb.title = f"Lineup ({game_type_display})"
-            emb.description = f"{description}"
+                if main_guild_obj and main_guild_obj.icon:
+                    emb.set_author(name="#2 Team List", icon_url=main_guild_obj.icon.url)
+                else:
+                    emb.set_author(name="#2 Team List")
 
         # Add subs field if any, and only if there are subs
         subs_list = state.get("subs", [])
@@ -394,10 +511,11 @@ async def refresh_lineup(arg, force_new_message: bool = False, author_override: 
 
         # Add footer with timestamp
         timestamp = datetime.now(timezone.utc).strftime("%I:%M %p")
-        footer_text = f"Requested by {author_for_footer.display_name}" if author_for_footer else "No author"
+        main_guild_for_footer = bot.get_guild(config.MAIN_GUILD_ID) if config.MAIN_GUILD_ID else None
+        footer_text = f"Requested by {author_for_footer.display_name}" if author_for_footer else (main_guild_for_footer.name if main_guild_for_footer else "Main Guild")
         emb.set_footer(
             text=f"{footer_text} • {timestamp}",
-            icon_url=author_for_footer.display_avatar.url if author_for_footer and author_for_footer.display_avatar else None
+            icon_url=author_for_footer.display_avatar.url if author_for_footer and author_for_footer.display_avatar else (main_guild_for_footer.icon.url if main_guild_for_footer and main_guild_for_footer.icon else None)
         )
         
         # Import TeamView locally to avoid circular dependency issues
@@ -410,7 +528,7 @@ async def refresh_lineup(arg, force_new_message: bool = False, author_override: 
     new_message_ids = [None] * len(message_ids) # Prepare for new IDs if sending new
 
     # Handle message sending based on context
-    if context_type in ["main_6s","main_8s"] and challenged_by_team_name:
+    if context_type in ["main_5s", "main_6s", "main_8s"] and challenged_by_team_name:
         # For challenged main channels, only show one message (main guild vs challenger)
         if embeds_and_views:  # Should be exactly one
             data = embeds_and_views[0]
@@ -498,9 +616,6 @@ async def refresh_lineup(arg, force_new_message: bool = False, author_override: 
             # This might happen if the interaction already had a followup sent (e.g. an error message from /lineup)
             # or if the interaction somehow truly expired despite deferral (less likely with followup).
             print(f"Error sending followup for lineup refresh: {e}")
-            # As a last resort, if followup fails, and if we absolutely need to notify, 
-            # we could try sending a new message to ctx.channel, but that's not ephemeral.
-            # For an ephemeral confirmation, if followup fails, it's usually best to just log it.
 
 async def format_lineup(team_state: dict, channel_id: int, guild_id: int = None) -> str:
     """Formats a single team's lineup into a string for embeds."""
@@ -511,85 +626,11 @@ async def format_lineup(team_state: dict, channel_id: int, guild_id: int = None)
     # Assuming team_state is a dict of {position: player_data}
     for pos, player_data in team_state.items():
         player = player_data['player'] if player_data else None
-        player_display = "❔" # Default to empty string
-        if player:
-            player_display = player.display_name # Works for both Member and TextPlayer
+        player_display = get_display_name(player, max_length=20)
 
         lineup_parts.append(f"`{pos}`: {player_display}")
 
     return "\n".join(lineup_parts) if lineup_parts else "Empty"
-
-async def format_ready_message(state: dict, channel_id: int, challenge_data: dict = None, is_opponent_ready: bool = False) -> tuple[str, discord.Embed]:
-    """Format the ready check message with current state, adapting for challenges."""
-    context_type = state.get("context_type")
-    initiating_team_name_from_state = state.get("team_name", "Team 1") # For team channels
-
-    embed_title = "Match Ready Check!"
-    current_signed_players_in_channel = 0 # Players signed in the channel where /ready is displayed
-    total_players_needed_for_game = 0 # Target for the ready count message (e.g. 6 for initiator's team in challenge)
-
-    if challenge_data: # Challenge mode
-        game_type = challenge_data["game_type"]
-        initiator_name = challenge_data["initiating_team_name"]
-        opponent_name = challenge_data["opponent_team_name"]
-        embed_title = f"Challenge: {initiator_name} vs {opponent_name} ({game_type.upper()}) - Ready Check"
-        
-        positions_for_game = SIXES_POSITIONS if game_type == "6s" else EIGHTS_POSITIONS
-
-        players_per_team = len(positions_for_game)
-        total_players_needed_for_game = players_per_team # Initiator's team needs their players ready
-
-        # Initiator's lineup (from current channel's state)
-        team1_lineup_str = await format_lineup(state["teams"][0], channel_id, state.get("guild_id"))
-        current_signed_players_in_channel = sum(1 for p in state["teams"][0].values() if p)
-
-        # Opponent's lineup (fetch their state)
-        opponent_lineup_str = "Opponent Lineup: Not available or not ready."
-        if is_opponent_ready:
-            opponent_state = get_channel_state(challenge_data["opponent_channel_id"])
-            if opponent_state:
-                opp_team_idx = 0 if challenge_data["opponent_guild_id"] != MAIN_GUILD_ID else 1
-                if len(opponent_state["teams"]) > opp_team_idx:
-                    opponent_lineup_str = await format_lineup(opponent_state["teams"][opp_team_idx], challenge_data["opponent_channel_id"], challenge_data["opponent_guild_id"])
-        
-        embed = discord.Embed(title=embed_title, color=discord.Color.orange())
-        embed.add_field(name=f"{initiator_name} (Your Team)", value=f"```\n{team1_lineup_str}```", inline=False)
-        embed.add_field(name=f"{opponent_name} (Opponent) - Ready: {'✅ Yes' if is_opponent_ready else '❌ No'}", value=f"```\n{opponent_lineup_str}```", inline=False)
-
-    else: # Standard matchmaking mode
-        if context_type in ["main_8s", "team_8s"]:
-            positions_for_game = EIGHTS_POSITIONS
-            total_players_needed_for_game = EIGHTS_PLAYERS_NEEDED if context_type == "main_8s" else len(positions_for_game)
-        elif context_type in ["main_6s", "team_6s"]:
-            positions_for_game = SIXES_POSITIONS
-            total_players_needed_for_game = SIXES_PLAYERS_NEEDED if context_type == "main_6s" else len(positions_for_game)
-
-        team1_lineup_str = await format_lineup(state["teams"][0], channel_id, state.get("guild_id"))
-        current_signed_players_in_channel = sum(1 for p in state["teams"][0].values() if p)
-        team_1_display_name = initiating_team_name_from_state if context_type == "team_8s" else "Team 1"
-        embed = discord.Embed(title=embed_title, color=0x2F3136)
-        embed.add_field(name=team_1_display_name, value=f"```\n{team1_lineup_str}```", inline=True)
-
-        if context_type in ["main_6s", "main_8s"] and len(state["teams"]) > 1:
-            team2_lineup_str = await format_lineup(state["teams"][1], channel_id, state.get("guild_id"))
-            embed.add_field(name="Team 2", value=f"```\n{team2_lineup_str}```", inline=True)
-            current_signed_players_in_channel += sum(1 for p in state["teams"][1].values() if p)
-        elif context_type in ["team_6s", "team_8s"]:
-            # For single team view, ensure only one team field if no challenge
-            pass # Team 1 field already added, opponent is CPU or via challenge
-
-    subs_text = ", ".join(sub.display_name for sub in state.get("subs", []) if sub) if state.get("subs") else "No subs"
-    embed.add_field(name="Subs", value=subs_text, inline=False)
-    
-    ready_players_mentions = [p.mention for p in state.get("ready", []) if not is_text_player(p) and hasattr(p, 'mention')]
-    # In challenge mode, total_players_needed_for_game refers to the initiator's team size for the ready count.
-    # In standard mode, it's the total for the match (1 or 2 teams).
-    content = f"Players Ready ({len(ready_players_mentions)}/{total_players_needed_for_game if challenge_data else current_signed_players_in_channel}): {(' '.join(ready_players_mentions)) if ready_players_mentions else 'Waiting for players...'}"
-    content += f"\nTotal Signed in this channel: {current_signed_players_in_channel}"
-    if challenge_data:
-        content += f"\nOpponent Team Lineup Ready: **{'Yes' if is_opponent_ready else 'No'}**"
-    
-    return content, embed 
 
 # This is an alias for refresh_lineup to be used in other modules.
 # It makes the import cleaner and hides the complex logic of the original function.
@@ -614,4 +655,97 @@ async def clear_and_refresh_channel(channel: discord.TextChannel):
 
 def update_state(channel_id: int, new_state: dict):
     """Directly update the state for a channel. Use with caution."""
-    signup_states[channel_id] = new_state 
+    signup_states[channel_id] = new_state
+
+async def restore_lineups_from_db():
+    """Restore lineup snapshots into memory and refresh embeds."""
+    try:
+        rows = await bot.db.teams.get_lineup_snapshots()
+    except Exception:
+        rows = []
+
+    if not rows:
+        return
+
+    for row in rows:
+        guild_id = row.get("guild_id")
+        raw_lineup = row.get("lineup") or {}
+        try:
+            if isinstance(raw_lineup, str):
+                raw_lineup = json.loads(raw_lineup)
+        except Exception:
+            raw_lineup = {}
+
+        channel_id = row.get("channel_id")
+        context_type = row.get("context_type") or raw_lineup.get("context_type")
+        if not channel_id or not context_type:
+            continue
+
+        channel = bot.get_channel(channel_id)
+        if not channel or not channel.guild:
+            continue
+
+        if context_type in ["main_8s", "team_8s"]:
+            positions = EIGHTS_POSITIONS
+        elif context_type in ["main_6s", "team_6s"]:
+            positions = SIXES_POSITIONS
+        elif context_type in ["main_5s", "team_5s"]:
+            positions = FIVES_POSITIONS
+        else:
+            continue
+
+        restored_state = {
+            "teams": [],
+            "message_ids": [None],
+            "subs": [],
+            "ready": [],
+            "context_type": context_type,
+            "guild_id": guild_id
+        }
+
+        teams_payload = raw_lineup.get("teams", [])
+        for team_payload in teams_payload:
+            team_dict = {p: None for p in positions}
+            if isinstance(team_payload, dict):
+                for pos in positions:
+                    p_data = team_payload.get(pos)
+                    if not p_data:
+                        continue
+                    if p_data.get("is_text"):
+                        team_dict[pos] = {"player": TextPlayer(p_data.get("name") or "Unknown")}
+                    else:
+                        member = channel.guild.get_member(p_data.get("id")) if p_data.get("id") else None
+                        if member:
+                            team_dict[pos] = {"player": member}
+                        else:
+                            team_dict[pos] = {"player": TextPlayer(p_data.get("name") or "Unknown")}
+            restored_state["teams"].append(team_dict)
+
+        subs_payload = raw_lineup.get("subs", [])
+        subs_list = []
+        if isinstance(subs_payload, list):
+            for s in subs_payload:
+                if not isinstance(s, dict):
+                    continue
+                if s.get("is_text"):
+                    subs_list.append(TextPlayer(s.get("name") or "Unknown"))
+                else:
+                    member = channel.guild.get_member(s.get("id")) if s.get("id") else None
+                    if member:
+                        subs_list.append(member)
+                    else:
+                        subs_list.append(TextPlayer(s.get("name") or "Unknown"))
+        restored_state["subs"] = subs_list
+
+        # Ensure main channels keep two team slots
+        if context_type in ["main_5s", "main_6s", "main_8s"] and len(restored_state["teams"]) < 2:
+            restored_state["teams"].append({p: None for p in positions})
+            restored_state["message_ids"] = [None, None]
+
+        signup_states[channel_id] = restored_state
+
+        # Refresh the visible lineup after restoring
+        try:
+            await sm_refresh_lineup(channel, force_new_message=True)
+        except Exception:
+            pass

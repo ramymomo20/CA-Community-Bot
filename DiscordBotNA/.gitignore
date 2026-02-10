@@ -34,3 +34,13 @@ config_local.py
 # Temporary files
 *.tmp
 *.temp 
+
+#main ignore files
+batch_register_players.csv
+DEPLOY_EDGE_FUNCTION.md
+parser_match.py
+schema.txt
+
+/scripts
+/supabase
+/iosca_flask_app

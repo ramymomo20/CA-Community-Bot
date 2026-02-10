@@ -1,5 +1,4 @@
 from ios_bot.config import *
-from ios_bot.database_manager import get_all_servers, get_all_servers_with_details
 import a2s
 
 @bot.slash_command(
@@ -25,7 +24,7 @@ async def server_status(
         # Show detailed server list for admins
         embed = Embed(title="Server List", description="All servers in the database:", color=discord.Color.blue())
         
-        servers = await get_all_servers_with_details()
+        servers = await bot.db.servers.get_all_servers_with_details()
         
         if not servers:
             await ctx.followup.send("No servers found in database.", ephemeral=True)
@@ -55,7 +54,7 @@ async def server_status(
     server_statuses = []
 
     # Get servers from database instead of hardcoded list
-    rcon_servers = await get_all_servers()
+    rcon_servers = await bot.db.servers.get_all_servers_with_details()
     
     if not rcon_servers:
         await ctx.respond("❌ No servers found in database. Please contact an administrator.")

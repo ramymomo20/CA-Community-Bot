@@ -1,6 +1,5 @@
 from ios_bot.config import *
 from ios_bot.signup_manager import get_channel_context
-from ios_bot.database_manager import get_all_servers, get_server_by_name
 
 # --- Cooldown Management ---
 request_sub_cooldowns = {}
@@ -123,7 +122,7 @@ class ServerSelectView(discord.ui.View):
         selected_server_name = self.children[0].values[0]
         
         # Get server details from database instead of hardcoded list
-        server_details = await get_server_by_name(selected_server_name)
+        server_details = await bot.db.servers.get_server_by_name(selected_server_name)
         if not server_details:
             await interaction.followup.send("❌ Error: Could not find details for the selected server.", ephemeral=True)
             return
@@ -145,7 +144,7 @@ async def request_sub(ctx: ApplicationContext):
     await ctx.defer(ephemeral=True)
 
     # Get servers from database instead of hardcoded list
-    rcon_servers = await get_all_servers()
+    rcon_servers = await bot.db.servers.get_all_servers()
     
     if not rcon_servers:
         await ctx.followup.send("❌ No servers found in database. Please contact an administrator.", ephemeral=True)

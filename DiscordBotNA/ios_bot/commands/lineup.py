@@ -22,6 +22,6 @@ async def lineup(ctx: ApplicationContext):
         # Interaction already deferred, so use followup
         await ctx.followup.send("❌ Invalid channel state. Could not initialize or retrieve.", ephemeral=True)
         return
-        
+
     await refresh_lineup(ctx, force_new_message=True)
     # The refresh_lineup function will now handle sending the ephemeral "Lineup refreshed!" message if called with ctx.

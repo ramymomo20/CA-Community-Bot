@@ -1,5 +1,5 @@
 from ios_bot.config import *
-from ios_bot.database_manager import get_team, get_all_teams
+from ios_bot.utils.name_utils import truncate_name
 
 class TeamSelectView(View):
     def __init__(self, author_id: int, teams_data: list):
@@ -121,7 +121,7 @@ class TeamSelectView(View):
 
             await interaction.response.defer(ephemeral=False)
             
-            team_details = await get_team(int(selected_value))
+            team_details = await bot.db.teams.get_team(int(selected_value))
 
             if not team_details:
                 await interaction.followup.send(content="Error: Could not fetch details for the selected team.", ephemeral=True)
@@ -162,6 +162,12 @@ class TeamInfoView(View):
     async def show_team_info(self, interaction):
         """Show basic team information."""
         team = self.team
+        try:
+            await bot.db.teams.update_team_average_rating(team['guild_id'])
+            team = await bot.db.teams.get_team(team['guild_id']) or team
+            self.team = team
+        except Exception:
+            pass
         
         embed = Embed(title=f"🏆 {team['guild_name']}", color=discord.Color.gold())
         embed.set_author(name=team.get('guild_name', 'Unknown Team'), 
@@ -186,7 +192,6 @@ class TeamInfoView(View):
                 vice_captain_display = vice_captain_member.display_name
         
         embed.add_field(name="👑 Captain", value=captain_display, inline=True)
-        embed.add_field(name="🎖️ Vice Captain", value=vice_captain_display, inline=True)
         embed.add_field(name="📋 Team ID", value=str(team['guild_id']), inline=True)
         
         # Add average team rating if available
@@ -198,7 +203,7 @@ class TeamInfoView(View):
         
         # Player count and channel info
         players_list = team.get('players', [])
-        total_players = len(players_list) + (1 if team.get('captain_id') else 0) + (1 if team.get('vice_captain_id') and team.get('vice_captain_id') != team.get('captain_id') else 0)
+        total_players = len(players_list) + (1 if team.get('captain_id') else 0)
         embed.add_field(name="👥 Total Players", value=str(total_players), inline=True)
 
         # Player list with role emojis - include captain and vice captain
@@ -263,13 +268,15 @@ class TeamInfoView(View):
     async def show_stats(self, interaction):
         """Show team statistics."""
         try:
-            from ios_bot.database_manager import get_team_statistics, get_top_team_players
-            
             await interaction.response.defer()
+            try:
+                await bot.db.teams.update_team_average_rating(self.team['guild_id'])
+            except Exception:
+                pass
             
             # Get team statistics
-            stats = await get_team_statistics(self.team['guild_id'])
-            top_players = await get_top_team_players(self.team['guild_id'], 5)
+            stats = await bot.db.matches.get_team_statistics(self.team['guild_id'])
+            top_players = await bot.db.players.get_top_team_players(self.team['guild_id'], 5)
             
             if not stats:
                 await interaction.edit_original_response(content="❌ No statistics found for this team.", embed=None, view=None)
@@ -310,7 +317,7 @@ class TeamInfoView(View):
             # Player statistics - simplified for now since we don't have player totals in the current structure
             embed.add_field(
                 name="👥 Team Summary",
-                value=f"**Recent Matches:** {len(stats.get('recent_matches', []))}\n**Team:** {stats.get('team_name', 'Unknown')}\n**Active:** Yes",
+                value=f"**Team:** {stats.get('team_name', 'Unknown')}\n**Active:** Yes",
                 inline=True
             )
             
@@ -333,23 +340,7 @@ class TeamInfoView(View):
                     inline=False
                 )
             
-            # Add recent matches info
-            recent_matches = stats.get('recent_matches', [])
-            if recent_matches:
-                recent_text = ""
-                for match in recent_matches[:3]:  # Show last 3 matches
-                    if isinstance(match, dict):
-                        home_team = match.get('home_team_name', 'Unknown')
-                        away_team = match.get('away_team_name', 'Unknown')
-                        scoreline = match.get('scoreline', '0-0')
-                        recent_text += f"**{home_team}** vs **{away_team}** ({scoreline})\n"
-                
-                if recent_text:
-                    embed.add_field(
-                        name="📅 Recent Matches",
-                        value=recent_text[:1024],
-                        inline=False
-                    )
+            # Recent matches removed from stats view (use the Matches button instead)
             
             # Create back button view
             view = TeamStatsView(self.team)
@@ -362,52 +353,10 @@ class TeamInfoView(View):
     async def show_matches(self, interaction):
         """Show recent matches."""
         try:
-            from ios_bot.database_manager import get_matches_by_team
-            
             await interaction.response.defer()
-            
-            matches = await get_matches_by_team(self.team['guild_id'], limit=10)
-            
-            embed = discord.Embed(
-                title=f"⚽ {self.team['guild_name']} - Recent Matches",
-                color=discord.Color.blue()
-            )
-            
-            if self.team.get('guild_icon'):
-                embed.set_thumbnail(url=self.team['guild_icon'])
-            
-            if not matches:
-                embed.description = "No matches found for this team in the database."
-                embed.add_field(
-                    name="💡 Note",
-                    value="Make sure CSV data has been imported using `/force_csv_import`",
-                    inline=False
-                )
-            else:
-                match_list = []
-                for match in matches:
-                    home_name = match['home_team_display_name']
-                    away_name = match['away_team_display_name']
-                    scoreline = match['scoreline']
-                    match_date = match['datetime'].strftime('%Y-%m-%d') if hasattr(match['datetime'], 'strftime') else str(match['datetime'])[:10]
-                    
-                    # Highlight the team's name
-                    if match['home_guild_id'] == self.team['guild_id']:
-                        match_text = f"**{home_name}** vs {away_name} ({scoreline}) - {match_date}"
-                    else:
-                        match_text = f"{home_name} vs **{away_name}** ({scoreline}) - {match_date}"
-                    
-                    match_list.append(match_text)
-                
-                embed.description = "\n".join(match_list)
-            
-            embed.set_footer(text=f"Showing last {len(matches)} matches")
-            
-            # Create back button view
-            view = TeamMatchesView(self.team)
-            
-            await interaction.edit_original_response(embed=embed, view=view)
-            
+            matches = await bot.db.matches.get_matches_by_team(self.team['guild_id'], limit=None)
+            view = TeamMatchesPaginationView(self.team, matches, page_size=10)
+            await interaction.edit_original_response(embed=view.build_embed(), view=view)
         except Exception as e:
             await interaction.edit_original_response(content=f"❌ Error loading matches: {str(e)}", embed=None, view=None)
 
@@ -444,45 +393,106 @@ class TeamStatsView(View):
         for item in self.children:
             item.disabled = True
 
-class TeamMatchesView(View):
-    def __init__(self, team):
+class TeamMatchesPaginationView(View):
+    def __init__(self, team, matches, page_size: int = 10):
         super().__init__(timeout=300)
         self.team = team
-        
-        # Back button
-        back_button = Button(label="← Back to Team", style=discord.ButtonStyle.secondary, emoji="🔙")
-        back_button.callback = self.back_to_team
-        self.add_item(back_button)
-    
+        self.matches = matches
+        self.page_size = page_size
+        self.page = 0
+        self.prev_button = Button(label="Previous", style=discord.ButtonStyle.secondary)
+        self.next_button = Button(label="Next", style=discord.ButtonStyle.secondary)
+        self.back_button = Button(label="Back to Team", style=discord.ButtonStyle.secondary, emoji="🔙")
+        self.prev_button.callback = self.prev_page
+        self.next_button.callback = self.next_page
+        self.back_button.callback = self.back_to_team
+        self._sync_buttons()
+        self.add_item(self.prev_button)
+        self.add_item(self.next_button)
+        self.add_item(self.back_button)
+
+    def _sync_buttons(self):
+        total_pages = max(1, (len(self.matches) - 1) // self.page_size + 1)
+        self.prev_button.disabled = self.page <= 0
+        self.next_button.disabled = self.page >= total_pages - 1
+        self.prev_button.label = f"Page {self.page + 1}/{total_pages}"
+
+    def build_embed(self):
+        team_id = self.team.get('guild_id')
+        start = self.page * self.page_size
+        end = start + self.page_size
+        page_matches = self.matches[start:end]
+
+        embed = discord.Embed(
+            title=f"Matches - {self.team['guild_name']}",
+            color=discord.Color.blue()
+        )
+        if self.team.get('guild_icon'):
+            embed.set_thumbnail(url=self.team['guild_icon'])
+
+        if not page_matches:
+            embed.description = "No matches found for this team in the database."
+            return embed
+
+        lines = []
+        for match in page_matches:
+            home_id = match.get('home_guild_id')
+            away_id = match.get('away_guild_id')
+            home_name = match.get('home_team_name') or match.get('home_team_display_name') or 'Home'
+            away_name = match.get('away_team_name') or match.get('away_team_display_name') or 'Away'
+            if home_id == team_id:
+                opponent = away_name
+            elif away_id == team_id:
+                opponent = home_name
+            else:
+                opponent = away_name
+            opponent = truncate_name(opponent, max_length=20)
+            scoreline = f"{match.get('home_score', 0)}-{match.get('away_score', 0)}"
+            dt = match.get('datetime')
+            date_str = dt.strftime('%Y-%m-%d') if hasattr(dt, 'strftime') else str(dt)[:10]
+            lines.append(f"vs {opponent} ({scoreline}) ({date_str})")
+
+        embed.description = "\n".join(lines)
+        embed.set_footer(text=f"Showing {len(page_matches)} of {len(self.matches)} matches")
+        return embed
+
+    async def prev_page(self, interaction):
+        await interaction.response.defer()
+        self.page = max(0, self.page - 1)
+        self._sync_buttons()
+        await interaction.edit_original_response(embed=self.build_embed(), view=self)
+
+    async def next_page(self, interaction):
+        await interaction.response.defer()
+        self.page += 1
+        self._sync_buttons()
+        await interaction.edit_original_response(embed=self.build_embed(), view=self)
+
     async def back_to_team(self, interaction):
-        """Return to team info view."""
         try:
             await interaction.response.defer()
             view = TeamInfoView(self.team)
             await view.show_team_info(interaction)
         except discord.errors.InteractionResponded:
-            # Interaction already responded to, create new view
             view = TeamInfoView(self.team)
             await view.show_team_info(interaction)
-        except Exception as e:
+        except Exception:
             await interaction.followup.send(content="❌ Error returning to team view. Please try again.", ephemeral=True)
-    
+
     async def on_timeout(self):
-        """Handle timeout by disabling the view."""
         for item in self.children:
             item.disabled = True
 
 @bot.slash_command(
     name="view_teams",
-    description="View a list of registered IOSPL teams and their details."
+    description="View a list of registered teams and their details."
 )
 async def view_teams_command(ctx: ApplicationContext):
     # Auto-cleanup all teams before displaying
     await ctx.defer(ephemeral=False)
     
     try:
-        from ios_bot.database_manager import clean_all_teams
-        cleanup_result = await clean_all_teams(max_players=17)
+        cleanup_result = await bot.db.teams.clean_all_teams(max_players=17)
         
         # Log cleanup results
         if cleanup_result:
@@ -494,8 +504,8 @@ async def view_teams_command(ctx: ApplicationContext):
                 print(f"Auto-cleanup completed: {total_teams_cleaned} teams processed, {total_duplicates_removed} duplicates removed, {total_players_removed} players removed")
     except Exception as e:
         print(f"Auto-cleanup failed: {e}")
-    
-    teams = await get_all_teams()
+
+    teams = await bot.db.teams.get_all_teams()
     if not teams:
         await ctx.followup.send("No teams are currently registered.", ephemeral=True)
         return

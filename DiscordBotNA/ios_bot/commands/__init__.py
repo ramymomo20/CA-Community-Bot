@@ -2,8 +2,9 @@ from .clear import clear
 from .help import help
 from .translate_english import translate_english
 from .translate_spanish import translate_spanish
-from .sign import sign
 from .lineup import lineup
+from .batch_register import batch_register
+from .sign import sign_slash
 from .unsign import unsign_slash
 from .ready import ready_slash
 from . import utils  # Import utils module for shared functions
@@ -22,5 +23,9 @@ from .view_player import view_player
 from .register_me import register_me
 from .view_match import view_match
 from .server_management import edit_servers
-from .tournament_system import register_tournament, view_tournament, delete_tournament_command
-from .team_mapping import cleanup_placeholder_teams_command
+from .check_players import check_players
+from .populate_team_stats import populate_team_stats
+from .recalculate_all import recalculate_all
+from .reevaluate_all_games import reevaluate_all_games
+from .sync_sftp_matches import sync_sftp_matches
+from .tournaments import create_tournament, view_tournament

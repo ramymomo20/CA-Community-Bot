@@ -1,5 +1,4 @@
 from ios_bot.config import *
-from ios_bot.database_manager import get_team, update_team_players, get_unique_player_ids, is_player_in_team_type
 
 def paginate_options(members, already_registered_ids, page_size=25):
     # Only eligible members, not bots, not already registered
@@ -39,7 +38,7 @@ class RegisterPlayersView(View):
         self.team_data = team_data
 
         # Use get_unique_player_ids to get ALL players currently part of the team (cap, vc, players list)
-        self.all_current_player_ids_on_team = get_unique_player_ids(self.team_data)
+        self.all_current_player_ids_on_team = bot.db.teams.get_unique_player_ids(self.team_data)
         
         # Pass this comprehensive set to paginate_options so cap/vc/existing players aren't shown for re-selection
         self.eligible_pages = paginate_options(guild.members, self.all_current_player_ids_on_team)
@@ -115,7 +114,7 @@ class RegisterPlayersView(View):
         team_type_str = "National Team" if self.team_data.get('is_national_team', False) else "Club Team"
 
         for player_id in ui_selected_ids:
-            conflicting_team = await is_player_in_team_type(player_id, self.team_data.get('is_national_team', False))
+            conflicting_team = await bot.db.teams.is_player_in_team_type(player_id, self.team_data.get('is_national_team', False))
             if conflicting_team:
                 member = self.guild.get_member(player_id)
                 await interaction.response.edit_message(
@@ -129,7 +128,6 @@ class RegisterPlayersView(View):
         # --- Explicit Validation ---
         # Although the selection UI should prevent this, we add a server-side check for robustness.
         captain_id = self.team_data.get('captain_id')
-        vice_captain_id = self.team_data.get('vice_captain_id')
         
         for player_id in ui_selected_ids:
             if player_id == captain_id:
@@ -137,14 +135,9 @@ class RegisterPlayersView(View):
                 await interaction.response.edit_message(content=f"❌ Error: The captain ({member.mention}) cannot be registered as a player.", view=None)
                 self.stop()
                 return
-            if player_id == vice_captain_id:
-                member = self.guild.get_member(player_id)
-                await interaction.response.edit_message(content=f"❌ Error: The vice-captain ({member.mention}) cannot be registered as a player.", view=None)
-                self.stop()
-                return
 
         # Get the current state of unique players on the team
-        current_unique_player_ids_on_team = get_unique_player_ids(self.team_data.get('players', []))
+        current_unique_player_ids_on_team = bot.db.teams.get_unique_player_ids(self.team_data.get('players', []))
         current_player_count_on_team = len(current_unique_player_ids_on_team)
         
         # Determine which of the UI-selected players are genuinely new and eligible
@@ -187,10 +180,8 @@ class RegisterPlayersView(View):
             self.stop()
             return
 
-        # Use transfer management system for adding players
+        # Add players directly to team
         try:
-            from ios_bot.transfer_management import add_player_to_team_with_transfer
-            
             newly_added_names = []
             already_present_selected_names = []
             
@@ -201,15 +192,10 @@ class RegisterPlayersView(View):
                     
                 if player_id in potential_new_additions_ids:
                     try:
-                        await add_player_to_team_with_transfer(
-                            self.guild.id, 
-                            player_id, 
-                            member.display_name,
-                            self.author_id,
-                            self.guild.get_member(self.author_id).display_name
-                        )
+                        # Add player directly to team
+                        await bot.db.teams.add_player_to_team(self.guild.id, player_id, member.display_name)
                         newly_added_names.append(member.display_name)
-                    except ValueError as e:
+                    except Exception as e:
                         await interaction.response.edit_message(content=f"❌ {str(e)}", view=None)
                         self.stop()
                         return
@@ -222,8 +208,8 @@ class RegisterPlayersView(View):
                     response_msg += f"**Selected but already on team (not added again):** {', '.join(already_present_selected_names)}."
                 
                 # Get updated team count
-                updated_team_data = await get_team(self.guild.id)
-                total_unique_players_after_add = len(get_unique_player_ids(updated_team_data.get('players', [])))
+                updated_team_data = await bot.db.teams.get_team(self.guild.id)
+                total_unique_players_after_add = len(bot.db.teams.get_unique_player_ids(updated_team_data.get('players', [])))
                 response_msg += f"\nThe team now has {total_unique_players_after_add} unique players."
 
                 await interaction.response.edit_message(content=response_msg, view=None)
@@ -246,7 +232,7 @@ async def register_players(ctx: ApplicationContext):
         return
 
     # get_team is now async
-    team_data = await get_team(guild.id) 
+    team_data = await bot.db.teams.get_team(guild.id) 
     if not team_data: # team_data would be None if get_team returns None
         await ctx.respond("This server is not registered as an IOSCA team. Use `/register_team` first.", ephemeral=True)
         return
@@ -258,14 +244,13 @@ async def register_players(ctx: ApplicationContext):
         return
         
     captain_id = team_data.get('captain_id')
-    vice_captain_id = team_data.get('vice_captain_id')
     
-    if not (ctx.user.id == captain_id or ctx.user.id == vice_captain_id):
-        await ctx.respond("You must be the team Captain or Vice-Captain to register players.", ephemeral=True)
+    if ctx.user.id != captain_id:
+        await ctx.respond("You must be the team Captain to register players.", ephemeral=True)
         return
 
     # Check 1: Team already full before starting registration, based on unique players
-    current_unique_ids = get_unique_player_ids(team_data.get('players', []))
+    current_unique_ids = bot.db.teams.get_unique_player_ids(team_data.get('players', []))
     if len(current_unique_ids) >= 9:
         await ctx.respond(f"Your team roster is full ({len(current_unique_ids)} unique players). No more players can be added.", ephemeral=True)
         return
@@ -285,7 +270,7 @@ async def remove_player(ctx: ApplicationContext, player: Option(Member, "Select 
         await ctx.respond("This command can only be used in a server.", ephemeral=True)
         return
 
-    team_data = await get_team(guild.id) # Await this
+    team_data = await bot.db.teams.get_team(guild.id) # Await this
     if not team_data:
         await ctx.respond("This server is not registered as an IOSCA team. Use `/register_team` first.", ephemeral=True)
         return
@@ -320,22 +305,10 @@ async def remove_player(ctx: ApplicationContext, player: Option(Member, "Select 
         await ctx.respond(f"{player.display_name} is not registered on this team.", ephemeral=True)
         return
 
-    # Use transfer management system for removing players
+    # Remove player directly from team
     try:
-        from ios_bot.transfer_management import remove_player_from_team_with_transfer
-        
-        await remove_player_from_team_with_transfer(
-            guild.id, 
-            player.id, 
-            player.display_name,
-            "Removed by team management",  # reason
-            ctx.user.id,  # processed_by_id
-            ctx.user.display_name  # processed_by_name
-        )
-        
+        await bot.db.teams.remove_player_from_team(guild.id, player.id)
         await ctx.respond(f"Successfully removed {player.display_name} from the team.", ephemeral=True)
         
-    except ValueError as e:
-        await ctx.respond(f"❌ {str(e)}", ephemeral=True)
     except Exception as e:
         await ctx.respond(f"❌ Error removing player: {str(e)}", ephemeral=True) 

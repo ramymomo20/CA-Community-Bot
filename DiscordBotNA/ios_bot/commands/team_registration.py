@@ -1,13 +1,40 @@
 from ios_bot.config import *
-from ios_bot.database_manager import add_team, get_team, retroactively_link_team_matches, update_guild_ids_for_registered_team, get_teams_by_captain_id
 from ios_bot.announcements import announce_team_created
 
+def auto_detect_matchmaking_channels(guild: discord.Guild):
+    """Auto-detect 5v5/6v6/8v8 channels by regex patterns."""
+    fives = []
+    sixes = []
+    eights = []
+
+    try:
+        fives_re = re.compile(FIVES_CHANNEL_REGEX_PATTERN, re.IGNORECASE)
+        sixes_re = re.compile(SIXES_CHANNEL_REGEX_PATTERN, re.IGNORECASE)
+        eights_re = re.compile(EIGHTS_CHANNEL_REGEX_PATTERN, re.IGNORECASE)
+    except re.error:
+        # Fallback to simple patterns if regex invalid
+        fives_re = re.compile(r"5v5", re.IGNORECASE)
+        sixes_re = re.compile(r"6v6", re.IGNORECASE)
+        eights_re = re.compile(r"8v8", re.IGNORECASE)
+
+    for ch in guild.text_channels:
+        if not ch.permissions_for(guild.me).send_messages:
+            continue
+        if fives_re.search(ch.name):
+            fives.append(ch.id)
+        if sixes_re.search(ch.name):
+            sixes.append(ch.id)
+        if eights_re.search(ch.name):
+            eights.append(ch.id)
+
+    return fives, sixes, eights
+
 class TeamTypeSelectView(View):
-    def __init__(self, author_id: int, guild: discord.Guild, vice_captain: discord.Member = None):
+    def __init__(self, author_id: int, guild: discord.Guild, captain_member=None):
         super().__init__(timeout=200)
         self.author_id = author_id
         self.guild = guild
-        self.vice_captain = vice_captain
+        self.captain_member = captain_member
         self.is_national_team = None
         self.is_mix_team = None
 
@@ -30,30 +57,8 @@ class TeamTypeSelectView(View):
         self.is_national_team = (custom_id == "team_type_national")
         self.is_mix_team = (custom_id == "team_type_mix")
         
-        # Check if captain already has a team of this type
-        captain_teams = await get_teams_by_captain_id(self.author_id)
-        existing_team_type = None
-        
-        for team in captain_teams:
-            if custom_id == "team_type_national" and team.get('is_national_team', False):
-                existing_team_type = "National Team"
-                break
-            elif custom_id == "team_type_mix" and team.get('is_mix_team', False):
-                existing_team_type = "Mix Team"
-                break
-            elif custom_id == "team_type_club" and not team.get('is_national_team', False) and not team.get('is_mix_team', False):
-                existing_team_type = "Club Team"
-                break
-        
-        if existing_team_type:
-            await interaction.edit_original_response(
-                content=f"❌ You already have a {existing_team_type} registered. Captains can only have one club team, one national team, and one mix team.",
-                view=None
-            )
-            return
-        
         # Proceed to the next step
-        registration_view = RegistrationView(self.author_id, self.guild, self.vice_captain, self.is_national_team, self.is_mix_team)
+        registration_view = RegistrationView(self.author_id, self.guild, self.is_national_team, self.is_mix_team, self.captain_member)
         await interaction.edit_original_response(
             content="Please provide the following details for team registration:", 
             view=registration_view
@@ -78,22 +83,24 @@ class ChannelSelect(Select):
             self.view.eights_channels_selected = selected_ids
         elif self.channel_type == "6v6":
             self.view.sixes_channels_selected = selected_ids
+        elif self.channel_type == "5v5":
+            self.view.fives_channels_selected = selected_ids
         self.disabled = True # Disable after selection
         # Check if all selections are done and then proceed
         await interaction.response.edit_message(view=self.view) 
         # We need a way to submit the whole form, perhaps a button in the view
 
 class RegistrationView(View):
-    def __init__(self, author_id: int, guild: discord.Guild, vice_captain: discord.Member = None, is_national_team: bool = False, is_mix_team: bool = False):
+    def __init__(self, author_id: int, guild: discord.Guild, is_national_team: bool = False, is_mix_team: bool = False, captain_member=None):
         super().__init__(timeout=200) # 3 minutes timeout
         self.author_id = author_id
         self.guild = guild
-        self.vice_captain_id = vice_captain.id if vice_captain else None
-        self.vice_captain_name = vice_captain.display_name if vice_captain else None
         self.is_national_team = is_national_team
         self.is_mix_team = is_mix_team
+        self.captain_member = captain_member
         self.eights_channels_selected = []
         self.sixes_channels_selected = []
+        self.fives_channels_selected = []
 
         # 8v8 Channel Selection (only channels with '8' in the name, max 25)
         text_channels_8s = [ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages and re.search(r'8', ch.name)]
@@ -106,6 +113,12 @@ class RegistrationView(View):
         text_channels_6s = text_channels_6s[:25]
         self.sixes_select = ChannelSelect(text_channels_6s, "6v6", max_selectable=2)
         self.add_item(self.sixes_select)
+
+        # 5v5 Channel Selection (only channels with '5v5' in the name, max 25)
+        text_channels_5s = [ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages and re.search(r'5v5', ch.name)]
+        text_channels_5s = text_channels_5s[:25]
+        self.fives_select = ChannelSelect(text_channels_5s, "5v5", max_selectable=2)
+        self.add_item(self.fives_select)
         
         # Submit Button
         self.submit_button = discord.ui.Button(label="Complete Registration", style=discord.ButtonStyle.success, custom_id="submit_registration")
@@ -119,47 +132,39 @@ class RegistrationView(View):
         # Defer the response immediately to avoid timeout
         await interaction.response.defer()
         
-        captain_id = self.author_id
-        captain_member = self.guild.get_member(captain_id)
+        from ios_bot.commands.utils import fetch_member_live
+        captain_member = self.captain_member or await fetch_member_live(self.guild, self.author_id) or interaction.user
+        captain_id = captain_member.id
         captain_name = captain_member.display_name
         guild_id = self.guild.id
         guild_name = self.guild.name
         guild_icon_url = str(self.guild.icon.url) if self.guild.icon else ""
 
-        # Handle vice captain None values
-        vice_captain_id = self.vice_captain_id if self.vice_captain_id else 0
-        vice_captain_name = self.vice_captain_name if self.vice_captain_name else ""
-
-        # Only allow players who have access to at least one selected matchmaking channel and are not already captain or vice captain
-        allowed_channels = set(self.eights_channels_selected + self.sixes_channels_selected)
+        # Only allow players who have access to at least one selected matchmaking channel and are not already captain
+        allowed_channels = set(self.eights_channels_selected + self.sixes_channels_selected + self.fives_channels_selected)
         selected_channels = [self.guild.get_channel(ch_id) for ch_id in allowed_channels if self.guild.get_channel(ch_id)]
         
         # Build initial players list - always include captain
         initial_players = [
             {"id": captain_id, "name": captain_name}
         ]
-        
-        # Add vice captain if exists
-        if self.vice_captain_id:
-            initial_players.append({"id": self.vice_captain_id, "name": self.vice_captain_name})
 
         # Prevent duplicate registration
-        if await get_team(guild_id):
+        if await bot.db.teams.get_team(guild_id):
             await interaction.followup.send(f"Team '{guild_name}' (this server) is already registered.", ephemeral=True)
             self.stop()
             return
 
         try:
-            success = await add_team(
+            success = await bot.db.teams.add_team(
             guild_id=guild_id,
             guild_name=guild_name,
             guild_icon=guild_icon_url,
             captain_id=captain_id,
             captain_name=captain_name,
-            vice_captain_id=vice_captain_id,
-            vice_captain_name=vice_captain_name,
             sixes_channels=self.sixes_channels_selected,
             eights_channels=self.eights_channels_selected,
+            fives_channels=self.fives_channels_selected,
             initial_players=initial_players,
             is_national_team=self.is_national_team,
             is_mix_team=self.is_mix_team
@@ -170,44 +175,39 @@ class RegistrationView(View):
                 "guild_id": guild_id,
                 "guild_name": guild_name,
                 "captain_id": captain_id,
-                "vice_captain_id": vice_captain_id,
                 "sixes_channels": self.sixes_channels_selected,
                 "eights_channels": self.eights_channels_selected,
+                "fives_channels": self.fives_channels_selected,
                 "initial_players": initial_players,
                 "is_national_team": self.is_national_team,
                 "is_mix_team": self.is_mix_team
             }, user_id=interaction.user.id, guild_id=guild_id, command="register_team")
             success = False
         
-        # Automatically update any NULL guild IDs in historical data
+        # CSV retroactive linking removed - no longer needed
         if success:
-            match_count, player_count = await update_guild_ids_for_registered_team(guild_id, guild_name)
-            
-            # Use transfer_management to register captain and vice captain as players
+            # Register captain as player directly
             try:
-                from ios_bot.transfer_management import add_player_to_team_with_transfer
-                
-                # Register captain as player
-                await add_player_to_team_with_transfer(
-                    guild_id,
-                    captain_id,
-                    captain_name,
-                    captain_id,
-                    captain_name
-                )
-                
-                # Register vice captain as player if exists
-                if self.vice_captain_id and self.vice_captain_name:
-                    await add_player_to_team_with_transfer(
-                        guild_id,
-                        self.vice_captain_id,
-                        self.vice_captain_name,
-                        captain_id,
-                        captain_name
-                    )
+                # Add captain to team's player list
+                team_data = await bot.db.teams.get_team(guild_id)
+                if team_data:
+                    players = team_data.get('players', [])
+                    if not any(p.get('discord_id') == captain_id for p in players):
+                        players.append({"id": captain_id, "name": captain_name})
+                        await bot.db.teams.update_team_players(guild_id, players)
             except Exception as e:
-                print(f"⚠️ Error during player registration with transfer management: {e}")
-                # Continue with team registration even if transfer fails
+                print(f"⚠️ Error during player registration: {e}")
+                # Continue with team registration even if player add fails
+
+            # Backfill match links for this newly registered team
+            try:
+                await bot.db.matches.backfill_matches_for_team(
+                    guild_id=guild_id,
+                    guild_name=guild_name,
+                    threshold=0.8
+                )
+            except Exception as e:
+                print(f"Warning: failed to backfill match links for team {guild_id}: {e}")
 
         if success:
             if self.is_national_team:
@@ -219,47 +219,13 @@ class RegistrationView(View):
             embed = discord.Embed(title="✅ Team Registration Successful!", color=discord.Color.green())
             embed.description = f"**{guild_name}** has been registered as a **{team_type_str}**."
             embed.add_field(name="Captain", value=captain_name, inline=True)
-            
-            if self.vice_captain_name:
-                embed.add_field(name="Vice Captain", value=self.vice_captain_name, inline=True)
-            else:
-                embed.add_field(name="Vice Captain", value="None", inline=True)
                 
             if self.eights_channels_selected:
                 embed.add_field(name="8v8 Channels", value=", ".join([f"<#{ch_id}>" for ch_id in self.eights_channels_selected]), inline=False)
             if self.sixes_channels_selected:
                 embed.add_field(name="6v6 Channels", value=", ".join([f"<#{ch_id}>" for ch_id in self.sixes_channels_selected]), inline=False)
-            
-            # Show automatically updated guild IDs
-            if match_count > 0 or player_count > 0:
-                embed.add_field(
-                    name="🔗 Historical Data Auto-Linked",
-                    value=f"Automatically linked **{match_count}** matches and **{player_count}** player records to this team!",
-                    inline=False
-                )
-            else:
-                embed.add_field(
-                    name="📊 Historical Data",
-                    value="No historical matches found for this team name in the database.",
-                    inline=False
-                )
-            
-            # Add retroactive match linking (keeping the old system for now)
-            try:
-                linked_matches = await retroactively_link_team_matches(guild_id, guild_name)
-                if linked_matches > 0:
-                    embed.add_field(
-                        name="🔗 Additional Matches Linked",
-                        value=f"Found and linked **{linked_matches}** additional historical matches using fuzzy matching!",
-                        inline=False
-                    )
-            except Exception as e:
-                print(f"⚠️ Error during retroactive linking for {guild_name}: {e}")
-                embed.add_field(
-                    name="⚠️ Note",
-                    value="Team registered successfully, but there was an issue with additional match linking.",
-                    inline=False
-                )
+            if self.fives_channels_selected:
+                embed.add_field(name="5v5 Channels", value=", ".join([f"<#{ch_id}>" for ch_id in self.fives_channels_selected]), inline=False)
             
             await interaction.edit_original_response(content=None, embed=embed, view=None)
             # Send announcement
@@ -274,34 +240,123 @@ class RegistrationView(View):
 
 @bot.slash_command(
     name="register_team",
-    description="Register your server as an IOSCA team and set up matchmaking channels. Vice captain is optional."
+    description="Register your server as an IOSCA team and set up matchmaking channels."
 )
 @commands.has_permissions(manage_guild=True)
-async def register_team(ctx, vice_captain: discord.Member = None):
+async def register_team(
+    ctx,
+    captain: Option(discord.Member, "Optional: set a different captain for the team", required=False) = None,
+    team_type: Option(str, "Team type: club, national, or mix", required=False) = None
+):
     guild = ctx.guild
     if not guild:
         await ctx.respond("This command can only be used in a server.", ephemeral=True)
         return
 
-    # --- Validation ---
-    if vice_captain:
-        # Basic validation for vice captain
-        if ctx.author.id == vice_captain.id:
-            await ctx.respond("❌ The captain cannot also be the vice-captain. Please select a different user.", ephemeral=True)
-            return
-        
-        # Prevent bot from being vice captain
-        if vice_captain.bot:
-            await ctx.respond("❌ Bots cannot be registered as vice captains. Please select a different user.", ephemeral=True)
-            return
-
     # Check if team already registered
-    if await get_team(guild.id):
+    if await bot.db.teams.get_team(guild.id):
         await ctx.respond(f"This server ('{guild.name}') is already registered as a team.", ephemeral=True)
         return
 
-    view = TeamTypeSelectView(ctx.author.id, guild, vice_captain)
-    await ctx.respond("First, what type of team are you registering?", view=view, ephemeral=True)
+    await ctx.defer(ephemeral=True)
+
+    # Determine captain
+    from ios_bot.commands.utils import fetch_member_live
+    captain_member = captain or await fetch_member_live(guild, ctx.author.id) or ctx.author
+    captain_id = captain_member.id
+    captain_name = captain_member.display_name
+
+    # Determine team type
+    team_type_value = (team_type or "club").strip().lower()
+    is_national_team = team_type_value == "national"
+    is_mix_team = team_type_value == "mix"
+
+    # Auto-detect channels by regex
+    fives_channels, sixes_channels, eights_channels = auto_detect_matchmaking_channels(guild)
+
+    guild_id = guild.id
+    guild_name = guild.name
+    guild_icon_url = str(guild.icon.url) if guild.icon else ""
+
+    initial_players = [{"id": captain_id, "name": captain_name}]
+
+    try:
+        success = await bot.db.teams.add_team(
+            guild_id=guild_id,
+            guild_name=guild_name,
+            guild_icon=guild_icon_url,
+            captain_id=captain_id,
+            captain_name=captain_name,
+            sixes_channels=sixes_channels,
+            eights_channels=eights_channels,
+            fives_channels=fives_channels,
+            initial_players=initial_players,
+            is_national_team=is_national_team,
+            is_mix_team=is_mix_team
+        )
+    except Exception as e:
+        from ios_bot.error_logger import log_error
+        log_error(e, context={
+            "guild_id": guild_id,
+            "guild_name": guild_name,
+            "captain_id": captain_id,
+            "sixes_channels": sixes_channels,
+            "eights_channels": eights_channels,
+            "fives_channels": fives_channels,
+            "initial_players": initial_players,
+            "is_national_team": is_national_team,
+            "is_mix_team": is_mix_team
+        }, user_id=ctx.author.id, guild_id=guild_id, command="register_team")
+        success = False
+
+    if success:
+        # Register captain as player directly
+        try:
+            team_data = await bot.db.teams.get_team(guild_id)
+            if team_data:
+                players = team_data.get('players', [])
+                if not any(p.get('discord_id') == captain_id for p in players):
+                    players.append({"id": captain_id, "name": captain_name})
+                    await bot.db.teams.update_team_players(guild_id, players)
+        except Exception as e:
+            print(f"⚠️ Error during player registration: {e}")
+
+        # Backfill match links for this newly registered team
+        try:
+            await bot.db.matches.backfill_matches_for_team(
+                guild_id=guild_id,
+                guild_name=guild_name,
+                threshold=0.8
+            )
+        except Exception as e:
+            print(f"Warning: failed to backfill match links for team {guild_id}: {e}")
+
+    if success:
+        if is_national_team:
+            team_type_str = "National Team"
+        elif is_mix_team:
+            team_type_str = "Mix Team"
+        else:
+            team_type_str = "Club Team"
+        embed = discord.Embed(title="✅ Team Registration Successful!", color=discord.Color.green())
+        embed.description = f"**{guild_name}** has been registered as a **{team_type_str}**."
+        embed.add_field(name="Captain", value=captain_name, inline=True)
+
+        if eights_channels:
+            embed.add_field(name="8v8 Channels", value=", ".join([f"<#{ch_id}>" for ch_id in eights_channels]), inline=False)
+        if sixes_channels:
+            embed.add_field(name="6v6 Channels", value=", ".join([f"<#{ch_id}>" for ch_id in sixes_channels]), inline=False)
+        if fives_channels:
+            embed.add_field(name="5v5 Channels", value=", ".join([f"<#{ch_id}>" for ch_id in fives_channels]), inline=False)
+
+        await ctx.followup.send(embed=embed, ephemeral=True)
+        await announce_team_created(
+            team_name=guild_name,
+            creator_name=captain_name,
+            guild_id=guild_id
+        )
+    else:
+        await ctx.followup.send("❌ Team registration failed. Please check console for errors.", ephemeral=True)
 
 @register_team.error
 async def register_team_error(ctx: ApplicationContext, error: discord.DiscordException):
@@ -321,13 +376,12 @@ async def register_team_error(ctx: ApplicationContext, error: discord.DiscordExc
             from ios_bot.error_logger import log_error
             log_error(error, context={
                 "command": "register_team",
-                "error_type": "AttributeError",
-                "description": "vice_captain parameter is string instead of Member object"
+                "error_type": "AttributeError"
             }, user_id=ctx.author.id, guild_id=ctx.guild_id, command="register_team")
             
             print(f"[ATTRIBUTE ERROR] User '{ctx.author.name}' (ID: {ctx.author.id}) "
-                  f"encountered an AttributeError with vice_captain parameter in /register_team")
-            await ctx.respond("❌ Error: Invalid vice-captain selection. Please select a valid user from this server.", ephemeral=True)
+                  f"encountered an AttributeError in /register_team")
+            await ctx.respond("❌ Error: An error occurred during registration. Please try again.", ephemeral=True)
         else:
             # Log all other errors
             from ios_bot.error_logger import log_error

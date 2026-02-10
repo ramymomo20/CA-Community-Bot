@@ -7,66 +7,33 @@ import asyncio
 import subprocess
 import sys
 import os
-import pandas as pd
 from datetime import datetime
 import pytz
 
-# Import database functions
+# Import bot instance for database access
 import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
-from database_manager import execute_query, execute_query_optimized, get_all_teams_with_details, database
-
-async def add_average_rating_column_to_teams():
-    """Add average_rating column to IOSCA_TEAMS table if it doesn't exist."""
-    print("🔧 Adding average_rating column to IOSCA_TEAMS table...")
-    
-    try:
-        # Check if column already exists
-        check_query = """
-        SELECT COUNT(*) as count 
-        FROM information_schema.columns 
-        WHERE table_schema = %s 
-        AND table_name = 'IOSCA_TEAMS' 
-        AND column_name = 'average_rating'
-        """
-        
-        result = await execute_query_optimized(
-            check_query, 
-            (database,), 
-            fetchone=True
-        )
-        
-        if result and result['count'] == 0:
-            # Column doesn't exist, add it
-            alter_query = """
-            ALTER TABLE IOSCA_TEAMS 
-            ADD COLUMN average_rating DECIMAL(4,2) DEFAULT NULL
-            """
-            
-            await execute_query(alter_query, commit=True)
-            print("✅ Added average_rating column to IOSCA_TEAMS table")
-        else:
-            print("ℹ️ average_rating column already exists in IOSCA_TEAMS table")
-            
-    except Exception as e:
-        print(f"❌ Error adding average_rating column: {e}")
+from ios_bot.config import bot
 
 async def update_team_average_ratings():
     """Calculate and update average ratings for all teams."""
     try:
         print("🔄 Calculating team average ratings...")
         
-        # Read the generated ratings file
-        ratings_path = os.path.join(os.path.dirname(__file__), 'final_ratings.csv')
-        if not os.path.exists(ratings_path):
-            print("❌ Ratings file not found. Cannot calculate team averages.")
+        # Get player ratings from database
+        ratings_query = "SELECT steam_id, rating FROM IOSCA_PLAYERS WHERE rating IS NOT NULL"
+        ratings_records = await bot.db.pool.fetch(ratings_query)
+        
+        if not ratings_records:
+            print("❌ No player ratings found in database. Cannot calculate team averages.")
             return
         
-        ratings_df = pd.read_csv(ratings_path)
+        # Convert to dict for easy lookup
+        ratings_dict = {r['steam_id']: r['rating'] for r in ratings_records}
         
         # Get all teams from database
-        teams = await get_all_teams_with_details()
+        teams = await bot.db.teams.get_all_teams()
         
         for team in teams:
             try:
@@ -84,16 +51,15 @@ async def update_team_average_ratings():
                     continue
                 
                 # Calculate average rating for this team
-                team_ratings = ratings_df[ratings_df['steamid'].isin(team_steam_ids)]['finalRating']
+                team_ratings = [ratings_dict[sid] for sid in team_steam_ids if sid in ratings_dict]
                 
                 if len(team_ratings) > 0:
-                    avg_rating = team_ratings.mean()
+                    avg_rating = sum(team_ratings) / len(team_ratings)
                     
                     # Update team in database with average rating
-                    await execute_query(
-                        "UPDATE IOSCA_TEAMS SET average_rating = %s WHERE guild_id = %s",
-                        (round(avg_rating, 2), team['guild_id']),
-                        commit=True
+                    await bot.db.pool.execute(
+                        "UPDATE IOSCA_TEAMS SET average_rating = $1 WHERE guild_id = $2",
+                        round(avg_rating, 2), team['guild_id']
                     )
                     
                     print(f"  - {team['guild_name']}: {len(team_ratings)} players, avg rating: {avg_rating:.2f}")
@@ -145,7 +111,6 @@ async def generate_weekly_player_ratings():
     except Exception as e:
         print(f"❌ An unexpected error occurred during weekly ratings generation: {e}")
 
-# Initialize the database column when this module is imported
 async def initialize_weekly_ratings():
-    """Initialize the weekly ratings system by ensuring the database column exists."""
-    await add_average_rating_column_to_teams() 
+    """Initialize the weekly ratings system. Column already exists in database."""
+    print("✅ Weekly ratings system initialized (average_rating column already exists)")

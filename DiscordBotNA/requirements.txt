@@ -1,0 +1,80 @@
+# rcon for RCON player queries
+rcon
+# ============================================================================
+# IOSCA Discord Bot - Complete Requirements
+# ============================================================================
+# Python 3.10+ required
+#
+# INSTALLATION:
+#   pip install -r requirements.txt
+
+# ===== DISCORD =====
+# Using py-cord for Discord API (alternative to discord.py)
+# py-cord 2.6+ supports slash commands
+py-cord>=2.6.1
+
+# ===== DATABASE =====
+# Async PostgreSQL (for Supabase)
+asyncpg>=0.29.0
+
+# LEGACY MYSQL - REMOVED
+# aiomysql>=0.2.0
+# mysql
+# mysql-connector-python>=8.0.33
+
+# ===== CONFIGURATION =====
+# Settings management with validation
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Environment variable loading
+python-dotenv>=1.0.0
+
+# ===== FUZZY MATCHING =====
+# Fast fuzzy string matching for team names
+rapidfuzz>=3.0.0
+
+# ===== STATISTICS & DATA PROCESSING =====
+# Data manipulation and CSV handling
+pandas>=2.0.0
+
+# Numerical computations
+numpy>=1.24.0
+
+# Graph generation
+matplotlib>=3.7.0
+
+# Optional: Prettier graph styling
+seaborn>=0.12.0
+
+# ===== IMAGE PROCESSING =====
+# Player card generation
+Pillow>=10.0.0
+
+# Downloading player avatars
+requests>=2.31.0
+
+# ===== GAME SERVER MANAGEMENT =====
+# RCON protocol for Source servers (correct package name is 'rcon')
+rcon>=2.4.0
+
+# SFTP for downloading match logs
+paramiko>=3.0.0
+asyncssh>=2.14.0
+
+# ===== STATE MANAGEMENT =====
+# Async Redis (optional, for distributed state)
+# Falls back to in-memory if not available
+redis>=5.0.0
+
+supabase>=2.0.0
+
+# ===== UTILITIES =====
+# Date/time utilities
+python-dateutil>=2.8.0
+pytz>=2023.3
+
+# ===== DEVELOPMENT/TESTING (optional) =====
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0

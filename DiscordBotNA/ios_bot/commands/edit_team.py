@@ -1,6 +1,55 @@
 from ios_bot.config import *
-from ios_bot.database_manager import get_team, update_team_details
 from ios_bot.commands.team_registration import ChannelSelect # Reusing ChannelSelect from team_registration
+import re
+import asyncio
+
+_ROLE_STOP_WORDS = {
+    "iosca", "team", "club", "fc", "cf", "sc", "sport", "sports", "de", "la", "el", "los", "las",
+    "the", "and", "of", "for", "a", "b"
+}
+
+def _tokenize_team_name(name: str) -> list[str]:
+    safe = re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
+    tokens = [t for t in safe.split() if len(t) >= 3 and t not in _ROLE_STOP_WORDS]
+    return tokens
+
+def _role_matches_team(role_name_l: str, team_name_l: str, tokens: list[str]) -> bool:
+    if "player" in role_name_l or "jugador" in role_name_l:
+        return True
+    if role_name_l and (role_name_l in team_name_l or team_name_l in role_name_l):
+        return True
+    for token in tokens:
+        if token in role_name_l:
+            return True
+    return False
+
+async def _sync_team_roster_from_roles(guild: discord.Guild, team_name: str) -> tuple[list[dict], list[str]]:
+    roles = [r for r in guild.roles if r.name and r.name != "@everyone"]
+    team_name_l = (team_name or "").lower()
+    tokens = _tokenize_team_name(team_name)
+
+    matched_roles = [r for r in roles if _role_matches_team(r.name.lower(), team_name_l, tokens)]
+
+    members = {}
+    for role in matched_roles:
+        for member in role.members:
+            members[member.id] = member
+
+    async def fetch_player(member: discord.Member) -> dict:
+        record = await bot.db.players.get_player_by_discord_id(member.id)
+        return {
+            "discord_id": member.id,
+            "id": member.id,
+            "name": member.display_name,
+            "steam_id": record.get("steam_id") if record else None
+        }
+
+    player_list: list[dict] = []
+    if members:
+        tasks = [fetch_player(m) for m in members.values()]
+        player_list = await asyncio.gather(*tasks)
+
+    return player_list, [r.name for r in matched_roles]
 
 class EditTeamChannelsView(View):
     def __init__(self, author_id: int, guild: discord.Guild, current_team_data: dict):
@@ -10,6 +59,7 @@ class EditTeamChannelsView(View):
         self.current_team_data = current_team_data
         self.new_sixes_channels = None # Store IDs
         self.new_eights_channels = None # Store IDs
+        self.new_fives_channels = None # Store IDs
 
         # Pre-populate with existing or validated channels.
         # The command logic will handle validation before creating this view.
@@ -17,13 +67,40 @@ class EditTeamChannelsView(View):
 
         all_text_channels = [ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages]
 
+        def build_channel_list(current_ids: list[int]) -> list[TextChannel]:
+            # Ensure current selections appear in the menu, then fill up to 25 total.
+            current_ids = [cid for cid in current_ids if isinstance(cid, int)]
+            current_channels = [guild.get_channel(cid) for cid in current_ids]
+            current_channels = [ch for ch in current_channels if isinstance(ch, TextChannel)]
+            seen = {ch.id for ch in current_channels}
+            remaining = [ch for ch in all_text_channels if ch.id not in seen]
+            # Keep deterministic ordering: current selections first, then by name.
+            remaining.sort(key=lambda ch: ch.name.lower())
+            return (current_channels + remaining)[:25]
+
         # 6v6 Channel Selection
-        self.sixes_select = ChannelSelect(all_text_channels, "6v6", max_selectable=2)
+        self.sixes_select = ChannelSelect(
+            build_channel_list(current_team_data.get("sixes_channels", [])),
+            "6v6",
+            max_selectable=2
+        )
         self.add_item(self.sixes_select)
 
         # 8v8 Channel Selection
-        self.eights_select = ChannelSelect(all_text_channels, "8v8", max_selectable=2)
+        self.eights_select = ChannelSelect(
+            build_channel_list(current_team_data.get("eights_channels", [])),
+            "8v8",
+            max_selectable=2
+        )
         self.add_item(self.eights_select)
+
+        # 5v5 Channel Selection
+        self.fives_select = ChannelSelect(
+            build_channel_list(current_team_data.get("fives_channels", [])),
+            "5v5",
+            max_selectable=2
+        )
+        self.add_item(self.fives_select)
         
         # Submit Button
         self.submit_button = Button(label="Update Channels", style=ButtonStyle.success, custom_id="submit_channel_update")
@@ -54,17 +131,28 @@ class EditTeamChannelsView(View):
         # Convert to int if they are strings from select values
         final_sixes_ids = [int(ch_id) for ch_id in final_sixes_ids if str(ch_id).isdigit()]
 
+        final_fives_ids = self.fives_select.values if hasattr(self.fives_select, 'values') and self.fives_select.values else self.current_team_data.get('fives_channels', [])
+
+        # Convert to int if they are strings from select values
+        final_fives_ids = [int(ch_id) for ch_id in final_fives_ids if str(ch_id).isdigit()]
+
         # Always update the guild name and icon in the database to match the current Discord guild
         guild_icon_url = self.guild.icon.url if self.guild.icon else None
-        await update_team_details(
+        await bot.db.teams.update_team_details(
             guild_id=self.guild.id,
             guild_name=self.guild.name,
-            guild_icon=guild_icon_url,
-            eights_channels=final_eights_ids,
-            sixes_channels=final_sixes_ids
+            guild_icon=guild_icon_url
         )
 
-        success = True # Assume update_team_details returns True if update succeeded
+        success = await bot.db.teams.update_team_channels(
+            guild_id=self.guild.id,
+            eights_channels=final_eights_ids,
+            sixes_channels=final_sixes_ids,
+            fives_channels=final_fives_ids
+        )
+
+        roster, matched_roles = await _sync_team_roster_from_roles(self.guild, self.guild.name)
+        await bot.db.teams.update_team_players(self.guild.id, roster)
 
         if success:
             await interaction.followup.send(f"✅ Team matchmaking channels for '{self.guild.name}' updated successfully!", ephemeral=True)
@@ -72,6 +160,14 @@ class EditTeamChannelsView(View):
             public_msg = f"Matchmaking channels for **{self.guild.name}** have been updated."
             if final_eights_ids:
                 public_msg += f"\n**8v8 Channels**: {', '.join([f'<#{ch_id}>' for ch_id in final_eights_ids])}"
+            if final_sixes_ids:
+                public_msg += f"\n**6v6 Channels**: {', '.join([f'<#{ch_id}>' for ch_id in final_sixes_ids])}"
+            if final_fives_ids:
+                public_msg += f"\n**5v5 Channels**: {', '.join([f'<#{ch_id}>' for ch_id in final_fives_ids])}"
+            if matched_roles:
+                public_msg += f"\n**Roster synced from roles**: {', '.join(matched_roles)}"
+            else:
+                public_msg += "\n**Roster synced from roles**: none matched (roster cleared)"
             await interaction.channel.send(public_msg)
 
         else:
@@ -81,10 +177,13 @@ class EditTeamChannelsView(View):
 
 
 @bot.slash_command(
-    name="edit_team_channels", # Renamed for clarity
-    description="Validate and update your team's matchmaking channels."
+    name="edit_team",
+    description="Edit your team's captain and matchmaking channels."
 )
-async def edit_team_channels_command(ctx: ApplicationContext):
+async def edit_team_channels_command(
+    ctx: ApplicationContext,
+    captain: Option(discord.Member, "Optional: set a new captain for this team", required=False) = None
+):
     guild = ctx.guild
     if not guild:
         await ctx.respond("This command can only be used in a server.", ephemeral=True)
@@ -94,7 +193,7 @@ async def edit_team_channels_command(ctx: ApplicationContext):
         await ctx.respond("❌ You need 'Manage Server' permissions to use this command.", ephemeral=True)
         return
 
-    team_data = await get_team(guild.id)
+    team_data = await bot.db.teams.get_team(guild_id=guild.id)
     if not team_data:
         await ctx.respond(f"This server ('{guild.name}') is not registered as a team. Use `/register_team` first.", ephemeral=True)
         return
@@ -103,11 +202,19 @@ async def edit_team_channels_command(ctx: ApplicationContext):
 
     # Always update the guild name and icon in the database to match the current Discord guild
     guild_icon_url = guild.icon.url if guild.icon else None
-    await update_team_details(
+    await bot.db.teams.update_team_details(
         guild_id=guild.id,
         guild_name=guild.name,
         guild_icon=guild_icon_url
     )
+
+    # Update captain if provided
+    if captain:
+        await bot.db.teams.update_team_captain(
+            guild_id=guild.id,
+            captain_id=captain.id,
+            captain_name=captain.display_name
+        )
 
     # Validate existing channels
     valid_eights = []
@@ -125,23 +232,32 @@ async def edit_team_channels_command(ctx: ApplicationContext):
             if channel and isinstance(channel, TextChannel):
                 valid_sixes.append(ch_id)
     team_data['sixes_channels'] = valid_sixes
+
+    valid_fives = []
+    if team_data.get('fives_channels'):
+        for ch_id in team_data['fives_channels']:
+            channel = guild.get_channel(ch_id)
+            if channel and isinstance(channel, TextChannel):
+                valid_fives.append(ch_id)
+    team_data['fives_channels'] = valid_fives
     
     # Update database with validated channels first (silent update if any changed)
     # This also ensures team_data used by the view is up-to-date.
-    await update_team_details(
-        guild_id=guild.id, 
+    await bot.db.teams.update_team_channels(
+        guild_id=guild.id,
         eights_channels=valid_eights,
-        sixes_channels=valid_sixes
+        sixes_channels=valid_sixes,
+        fives_channels=valid_fives
     )
     
     # Fetch the potentially updated team_data for the view
-    updated_team_data = await get_team(guild.id)
+    updated_team_data = await bot.db.teams.get_team(guild.id)
 
     view = EditTeamChannelsView(ctx.author.id, guild, updated_team_data)
     await ctx.followup.send(
         "**Edit Matchmaking Channels**\n"
         "Your current channels have been validated. Channels that no longer exist or are inaccessible have been removed.\n"
-        "Use the dropdowns below to select your new 6v6 and/or 8v8 matchmaking channels. "
+        "Use the dropdowns below to select your new 5v5, 6v6 and/or 8v8 matchmaking channels. "
         "Making a selection will override previous settings for that type.", 
         view=view, 
         ephemeral=True

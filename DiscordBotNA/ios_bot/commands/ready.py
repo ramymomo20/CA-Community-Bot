@@ -2,34 +2,27 @@ from ios_bot.config import *
 from ios_bot.signup_manager import (
     init_state, 
     get_channel_state, 
-    format_ready_message, 
     is_text_player,
     clear_channel_state,
+    clear_and_refresh_channel,
+    update_state,
     refresh_lineup as sm_refresh_lineup, # Aliased
-    TextPlayer,
-    get_player_position,
     get_channel_context,
-    check_notification_cooldown, # Added import
     format_lineup, # Added import
-    update_state
 )
 from ios_bot.commands.utils import delete_after_delay, move_sub_to_position # Added move_sub_to_position import
 from ios_bot.challenge_manager import active_challenges
 from ios_bot.announcements import announce_match_ready # Added import
-from ios_bot.database_manager import add_active_match, get_team_by_name, get_all_servers, get_server_by_name
 from ios_bot.commands.request_sub import get_server_status, get_server_status_sync
+from ios_bot.semaphores import ready_semaphore
 
 import time as clock
-
-# The hard-coded RCON info is now removed.
-# The bot will use the RCON_SERVERS list from config.py,
-# which can be dynamically updated by the new /edit_main_server command.
 
 # Available maps per format
 MAP_POOLS = {
     "8v8": ["8v8_coral","8v8_italia", "8v8_london", "8v8_vienna"],
-    "6v6": ["6v6_south", "6v6_peacock_park"]
-}
+    "6v6": ["6v6_south", "6v6_peacock_park"],
+    "5v5": ["5v5_night_academy"]}
 
 # --- Global variable to control lineup checks for testing ---
 SKIP_LINEUP_CHECKS_FOR_TESTING = False
@@ -49,7 +42,13 @@ def check_match_readiness(initiator_state: dict, opponent_state: dict = None, ga
     Fullness Rule: Each team must have all field positions filled.
     Returns (are_teams_ready, error_or_status_message)
     """
-    positions = EIGHTS_POSITIONS if game_type == "8s" else SIXES_POSITIONS
+    # Validate lineup exists
+    if not initiator_state or not initiator_state.get("teams"):
+        return False, "❌ Initiator lineup not available. Please ensure all positions are filled."
+    
+    if opponent_state and not opponent_state.get("teams"):
+        return False, "❌ Opponent lineup not available. Please ensure all positions are filled."
+    positions = EIGHTS_POSITIONS if game_type == "8s" else SIXES_POSITIONS if game_type == "6s" else FIVES_POSITIONS
     teams_to_check = []
     team_names_for_error_msgs = [] # For more precise error messages
 
@@ -76,8 +75,8 @@ def check_match_readiness(initiator_state: dict, opponent_state: dict = None, ga
 
         # Determine opponent's name for messages first
         opponent_name_for_msg = opponent_state.get("team_name", "Opponent")
-        if opponent_state.get("context_type") in ["main_8s", "main_6s"] and opponent_state.get("is_challenged_by_team_name"):
-            opponent_name_for_msg = f"Main Guild Team (vs {opponent_state.get('is_challenged_by_team_name')})"
+        if opponent_state.get("context_type") in ["main_8s", "main_6s", "main_5s"] and opponent_state.get("is_challenged_by_team_name"):
+            opponent_name_for_msg = f"IOSCA (vs {opponent_state.get('is_challenged_by_team_name')})"
         
         if not opponent_state.get("teams") or not opponent_state["teams"][0]:
             return False, f"Error: {opponent_name_for_msg} lineup data is missing."
@@ -192,6 +191,9 @@ class MapSelect(View):
         elif self.original_fmt == "6s":
             map_pool_key_fmt = "6v6"
             display_fmt = "6v6"
+        elif self.original_fmt == "5s":
+            map_pool_key_fmt = "5v5"
+            display_fmt = "5v5"
         else:
             # Fallback or error if fmt is unexpected, though ready_slash should ensure "8s"
             map_pool_key_fmt = self.original_fmt 
@@ -234,15 +236,12 @@ class MapSelect(View):
         port = int(port_str)
         with Client(host, port, passwd=server_passwd) as r:
             r.run("changelevel", selected_map)
-        # Consider if time.sleep is truly needed here or if RCON server handles rapid commands
-        # If it's blocking, it should also be part of a to_thread call if absolutely necessary,
-        # but ideally, the RCON server itself manages command processing.
-        # For now, assuming it's short enough or can be part of the threaded execution.
+
         clock.sleep(0.5) # This sleep will also happen in the thread
         with Client(host, port, passwd=server_passwd) as r:
             r.run("exec", cfg_name)
             r.run("sv_singlekeeper 1")
-            r.run("mp_teamkits 56 55")
+            r.run("mp_teamkits 22 21")
             
             # Generate team names for mp_teamnames command
             initiator_name = self.guild_name
@@ -281,32 +280,38 @@ class MapSelect(View):
         # --- Store active match context for non-official teams ---
         if self.opponent_guild_name:
             try:
-                initiator_is_official = await get_team_by_name(self.guild_name)
-                opponent_is_official = await get_team_by_name(self.opponent_guild_name)
+                initiator_is_official = await bot.db.teams.get_team_by_name(self.guild_name)
+                opponent_is_official = await bot.db.teams.get_team_by_name(self.opponent_guild_name)
                 
                 # If both teams are not in the IOSCA_TEAMS table, we track the match
                 if not initiator_is_official and not opponent_is_official:
-                    await add_active_match(
+                    await bot.db.matches.add_active_match(
+                        channel_id=interaction.channel_id,
                         team1_name=self.guild_name,
-                        team2_name=self.opponent_guild_name,
-                        channel_id=interaction.channel_id
+                        team2_name=self.opponent_guild_name
                     )
-                    print(f"[Match Tracker] Logged active non-IOSPL match: {self.guild_name} vs {self.opponent_guild_name} in channel {interaction.channel_id}")
+                    print(f"[Match Tracker] Logged active match: {self.guild_name} vs {self.opponent_guild_name} in channel {interaction.channel_id}")
             except Exception as e:
                 print(f"[ERROR] Database check for active match failed: {e}")
         
         selected_map = interaction.data["values"][0]
         
         # Find the correct RCON password for the selected server
-        server_details = await get_server_by_name(self.region_key)
+        server_details = await bot.db.servers.get_server_by_name(self.region_key)
 
         if not server_details:
             await interaction.followup.send(f"❌ Critical Error: Could not find the details for server '{self.region_key}'. Please try again.", ephemeral=True)
             return
             
         server_passwd = server_details.get("password")
-        
-        cfg_name = "8v8" if self.original_fmt == "8s" else "6v6"
+
+        # Select server cfg based on match format
+        if self.original_fmt == "8s":
+            cfg_name = "8v8"
+        elif self.original_fmt == "6s":
+            cfg_name = "6v6"
+        elif self.original_fmt == "5s":
+            cfg_name = "5v5"
 
         try:
             loop = asyncio.get_running_loop()
@@ -422,16 +427,9 @@ class MapSelect(View):
     async def on_timeout(self):
         if self.children and isinstance(self.children[0], Select):
             self.children[0].disabled = True
-        # Try to edit the original message if possible, otherwise ignore (it might have been handled)
-        # This timeout might happen if user never selects a map.
         try:
-            # This assumes 'self.message' is set by the view, which might not be the case
-            # if the view is added to an existing message not sent by interaction.response.send_message(view=self).
-            # For views attached to interaction.edit_original_response, the original interaction.message is the target.
             if hasattr(self, 'message') and self.message: # Check if self.message exists
                  await self.message.edit(content="Map selection timed out.", view=None)
-            # elif hasattr(self, 'interaction') and self.interaction: # Fallback if self.interaction is stored
-            #    await self.interaction.edit_original_response(content="Map selection timed out.", view=None)
 
         except discord.NotFound:
             pass # Message might have been deleted
@@ -457,7 +455,7 @@ class RegionSelect(View):
         options = []
         
         # Get servers from database instead of hardcoded list
-        rcon_servers = await get_all_servers()
+        rcon_servers = await bot.db.servers.get_all_servers()
 
         if not rcon_servers:
             options.append(SelectOption(label="No servers available", value="no_servers_available"))
@@ -499,7 +497,7 @@ class RegionSelect(View):
              return
         
         # Get server details from database instead of hardcoded list
-        server_details = await get_server_by_name(selected_region_key)
+        server_details = await bot.db.servers.get_server_by_name(selected_region_key)
         if not server_details:
             await interaction.followup.send(f"❌ Error: Could not find details for server '{selected_region_key}'.", ephemeral=True)
             return
@@ -552,304 +550,298 @@ class RegionSelect(View):
 )
 async def ready_slash(ctx: ApplicationContext):
     await ctx.defer(ephemeral=False) # Initial response can be edited
-    guild_id = ctx.guild_id
-    channel_id = ctx.channel_id
-    state = get_channel_state(channel_id) # Current channel's state
-    channel_context = await get_channel_context(guild_id, channel_id)
-    context_type = channel_context.get("type")
-
-    if not state:
-        state = await init_state(guild_id, channel_id)
-        if not state:
-            # Changed to edit_original_response as defer is not ephemeral
-            await ctx.interaction.edit_original_response(content="❌ Error initializing channel state. Cannot ready.")
-            return
-
-    # --- Determine Authoritative Game Type & Challenge Context ---
-    authoritative_game_type = None
-    active_challenge_for_this_channel = None
-    is_initiator = False
     
-    # These will be populated if a challenge is found and applies
-    opponent_state_for_challenge = None 
-    # state_for_readiness_check will hold the initiator's state if current channel is opponent in a challenge
-    state_for_readiness_check = state # Default to current channel's state
+    # Use semaphore to prevent concurrent ready command executions
+    async with ready_semaphore:
+        guild_id = ctx.guild_id
+        channel_id = ctx.channel_id
+        state = get_channel_state(channel_id) # Current channel's state
+        channel_context = await get_channel_context(guild_id, channel_id)
+        context_type = channel_context.get("type")
 
-    for ch_id, ch_data_item in active_challenges.items():
-        if ch_data_item.get("status") == "accepted":
-            if ch_data_item.get("initiating_channel_id") == channel_id:
-                active_challenge_for_this_channel = ch_data_item
-                authoritative_game_type = active_challenge_for_this_channel.get("game_type")
-                is_initiator = True
-                opponent_state_for_challenge = get_channel_state(active_challenge_for_this_channel.get("opponent_channel_id"))
-                # state_for_readiness_check remains 'state' (current channel's state)
-                break
-            elif ch_data_item.get("opponent_channel_id") == channel_id:
-                active_challenge_for_this_channel = ch_data_item
-                authoritative_game_type = active_challenge_for_this_channel.get("game_type")
-                is_initiator = False
-                opponent_state_for_challenge = state # Current channel (opponent) state
-                
-                # Try to get initiator's state, and initialize it if it doesn't exist
-                initiator_channel_id = active_challenge_for_this_channel.get("initiating_channel_id")
-                state_for_readiness_check = get_channel_state(initiator_channel_id)
-                
-                if not state_for_readiness_check:
-                    # Log the error for debugging
-                    print(f"[READY CRITICAL ERROR] Could not retrieve initiator's state for challenge:")
-                    print(f"  - Challenge ID: {active_challenge_for_this_channel.get('challenge_id', 'Unknown')}")
-                    print(f"  - Initiator Channel ID: {initiator_channel_id}")
-                    print(f"  - Initiator Guild ID: {active_challenge_for_this_channel.get('initiating_guild_id', 'Unknown')}")
-                    print(f"  - Current Channel ID: {channel_id}")
-                    print(f"  - Current Guild ID: {ctx.guild_id}")
+        if not state:
+            state = await init_state(guild_id, channel_id)
+            if not state:
+                # Changed to edit_original_response as defer is not ephemeral
+                await ctx.interaction.edit_original_response(content="❌ Error initializing channel state. Cannot ready.")
+                return
+
+        # --- Determine Authoritative Game Type & Challenge Context ---
+        authoritative_game_type = None
+        active_challenge_for_this_channel = None
+        is_initiator = False
+        
+        # These will be populated if a challenge is found and applies
+        opponent_state_for_challenge = None 
+        # state_for_readiness_check will hold the initiator's state if current channel is opponent in a challenge
+        state_for_readiness_check = state # Default to current channel's state
+
+        for ch_id, ch_data_item in active_challenges.items():
+            if ch_data_item.get("status") == "accepted":
+                if ch_data_item.get("initiating_channel_id") == channel_id:
+                    active_challenge_for_this_channel = ch_data_item
+                    authoritative_game_type = active_challenge_for_this_channel.get("game_type")
+                    is_initiator = True
+                    opponent_state_for_challenge = get_channel_state(active_challenge_for_this_channel.get("opponent_channel_id"))
+                    # state_for_readiness_check remains 'state' (current channel's state)
+                    break
+                elif ch_data_item.get("opponent_channel_id") == channel_id:
+                    active_challenge_for_this_channel = ch_data_item
+                    authoritative_game_type = active_challenge_for_this_channel.get("game_type")
+                    is_initiator = False
+                    opponent_state_for_challenge = state # Current channel (opponent) state
                     
-                    # Try to initialize the initiator's state if it doesn't exist
-                    try:
-                        initiator_guild_id = active_challenge_for_this_channel.get("initiating_guild_id")
-                        if initiator_guild_id:
-                            state_for_readiness_check = await init_state(initiator_guild_id, initiator_channel_id)
-                            if not state_for_readiness_check:
+                    # Try to get initiator's state, and initialize it if it doesn't exist
+                    initiator_channel_id = active_challenge_for_this_channel.get("initiating_channel_id")
+                    state_for_readiness_check = get_channel_state(initiator_channel_id)
+                    
+                    if not state_for_readiness_check:
+                        # Log the error for debugging
+                        print(f"[READY CRITICAL ERROR] Could not retrieve initiator's state for challenge:")
+                        print(f"  - Challenge ID: {active_challenge_for_this_channel.get('challenge_id', 'Unknown')}")
+                        print(f"  - Initiator Channel ID: {initiator_channel_id}")
+                        print(f"  - Initiator Guild ID: {active_challenge_for_this_channel.get('initiating_guild_id', 'Unknown')}")
+                        print(f"  - Current Channel ID: {channel_id}")
+                        print(f"  - Current Guild ID: {ctx.guild_id}")
+                        
+                        # Try to initialize the initiator's state if it doesn't exist
+                        try:
+                            initiator_guild_id = active_challenge_for_this_channel.get("initiating_guild_id")
+                            if initiator_guild_id:
+                                state_for_readiness_check = await init_state(initiator_guild_id, initiator_channel_id)
+                                if not state_for_readiness_check:
+                                    await ctx.interaction.edit_original_response(
+                                        content="❌ Critical Error: Could not retrieve or initialize initiator's state for an accepted challenge. "
+                                        "The challenging team may need to sign up players first."
+                                    )
+                                    return
+                            else:
                                 await ctx.interaction.edit_original_response(
-                                    content="❌ Critical Error: Could not retrieve or initialize initiator's state for an accepted challenge. "
-                                    "The challenging team may need to sign up players first."
+                                    content="❌ Critical Error: Could not retrieve initiator's state for an accepted challenge. "
+                                    "Challenge data is missing initiator guild ID."
                                 )
                                 return
-                        else:
+                        except Exception as e:
+                            print(f"[READY ERROR] Failed to initialize initiator state for challenge: {e}")
                             await ctx.interaction.edit_original_response(
                                 content="❌ Critical Error: Could not retrieve initiator's state for an accepted challenge. "
-                                "Challenge data is missing initiator guild ID."
+                                "The challenging team may need to sign up players first."
                             )
                             return
-                    except Exception as e:
-                        print(f"[READY ERROR] Failed to initialize initiator state for challenge: {e}")
-                        await ctx.interaction.edit_original_response(
-                            content="❌ Critical Error: Could not retrieve initiator's state for an accepted challenge. "
-                            "The challenging team may need to sign up players first."
-                        )
-                        return
-                break
-    
-    if active_challenge_for_this_channel:
-        if not authoritative_game_type: # Handles None or empty string
-            await ctx.interaction.edit_original_response(content=f"❌ Error: Game type is missing or invalid in the active challenge data (Challenge ID: {active_challenge_for_this_channel.get('challenge_id','N/A')}). Cannot proceed.")
+                    break
+        
+        if active_challenge_for_this_channel:
+            if not authoritative_game_type: # Handles None or empty string
+                await ctx.interaction.edit_original_response(content=f"❌ Error: Game type is missing or invalid in the active challenge data (Challenge ID: {active_challenge_for_this_channel.get('challenge_id','N/A')}). Cannot proceed.")
+                return
+        else: # Standard matchmaking (not a challenge)
+            if context_type in ["main_8s", "team_8s"]:
+                authoritative_game_type = "8s"
+            elif context_type in ["main_6s", "team_6s"]:
+                authoritative_game_type = "6s"
+            elif context_type in ["main_5s", "team_5s"]:
+                authoritative_game_type = "5s"
+            else: # Not a known channel type for matchmaking and not a challenge
+                await ctx.interaction.edit_original_response(content=f"❌ This command can only be used in a designated 8s, 6s, or 5s matchmaking channel, or as part of an active challenge. This channel's current type is '{context_type}'.")
+                return
+
+        # Final explicit check
+        if not authoritative_game_type:
+            await ctx.interaction.edit_original_response(content="❌ Critical Error: Could not determine the game type for the match. Please contact an admin.")
+            print(f"[CRITICAL ERROR] ready_slash: authoritative_game_type is None/empty. channel_id: {channel_id}, context_type: {context_type}, active_challenge_id: {active_challenge_for_this_channel.get('challenge_id', 'None') if active_challenge_for_this_channel else 'None'}")
             return
-    else: # Standard matchmaking (not a challenge)
-        if context_type in ["main_8s", "team_8s"]:
-            authoritative_game_type = "8s"
-        elif context_type in ["main_6s", "team_6s"]:
-            authoritative_game_type = "6s"
-        else: # Not a known channel type for matchmaking and not a challenge
-            await ctx.interaction.edit_original_response(content=f"❌ This command can only be used in a designated 8s or 6s matchmaking channel, or as part of an active challenge. This channel's current type is '{context_type}'.")
+
+        # --- Perform Readiness Checks ---
+        are_teams_ready = False
+        readiness_message = ""
+
+        # Determine the correct initiator state for check_match_readiness
+        actual_initiator_state_for_check = state_for_readiness_check
+
+        if SKIP_LINEUP_CHECKS_FOR_TESTING:
+            readiness_message = "Teams considered ready for testing (checks skipped)."
+            are_teams_ready = True
+        elif active_challenge_for_this_channel:
+            # Ensure the variables passed to check_match_readiness are correctly assigned based on 'is_initiator'
+            check_initiator = actual_initiator_state_for_check if not is_initiator else state
+            check_opponent = state if not is_initiator else opponent_state_for_challenge
+            
+            # Additional validation and debugging
+            print(f"[READY DEBUG] Challenge readiness check:")
+            print(f"  - is_initiator: {is_initiator}")
+            print(f"  - check_initiator exists: {check_initiator is not None}")
+            print(f"  - check_opponent exists: {check_opponent is not None}")
+            print(f"  - check_initiator teams: {len(check_initiator.get('teams', [])) if check_initiator else 0}")
+            print(f"  - check_opponent teams: {len(check_opponent.get('teams', [])) if check_opponent else 0}")
+            
+            if not check_initiator:
+                 print(f"[READY ERROR] Initiator state missing for challenge {active_challenge_for_this_channel.get('challenge_id', 'Unknown')}")
+                 await ctx.interaction.edit_original_response(content="❌ Error: Initiator state data is missing for challenge readiness check.")
+                 return
+            if not check_opponent:
+                 print(f"[READY ERROR] Opponent state missing for challenge {active_challenge_for_this_channel.get('challenge_id', 'Unknown')}")
+                 await ctx.interaction.edit_original_response(content="❌ Error: Opponent state data is missing for challenge readiness check. They may need to use /ready or sign up players.")
+                 return
+            are_teams_ready, readiness_message = check_match_readiness(check_initiator, check_opponent, authoritative_game_type)
+        else: # Standard matchmaking (not a challenge, not skipping checks)
+             are_teams_ready, readiness_message = check_match_readiness(actual_initiator_state_for_check, None, authoritative_game_type)
+
+        if not are_teams_ready:
+            await ctx.interaction.edit_original_response(content=readiness_message)
             return
-
-    # Final explicit check
-    if not authoritative_game_type:
-        await ctx.interaction.edit_original_response(content="❌ Critical Error: Could not determine the game type for the match. Please contact an admin.")
-        print(f"[CRITICAL ERROR] ready_slash: authoritative_game_type is None/empty. channel_id: {channel_id}, context_type: {context_type}, active_challenge_id: {active_challenge_for_this_channel.get('challenge_id', 'None') if active_challenge_for_this_channel else 'None'}")
-        return
-
-    # --- Perform Readiness Checks ---
-    are_teams_ready = False
-    readiness_message = ""
-
-    # Determine the correct initiator state for check_match_readiness
-    # If it's a challenge and current channel is opponent, state_for_readiness_check is initiator's.
-    # Otherwise (not a challenge, or current channel is initiator), state_for_readiness_check is current channel's state ('state').
-    actual_initiator_state_for_check = state_for_readiness_check
-
-    if SKIP_LINEUP_CHECKS_FOR_TESTING:
-        readiness_message = "Teams considered ready for testing (checks skipped)."
-        are_teams_ready = True
-    elif active_challenge_for_this_channel:
-        # 'actual_initiator_state_for_check' should be the true initiator's state.
-        # 'opponent_state_for_challenge' should be the true opponent's state.
         
-        # If current channel is initiator, actual_initiator_state_for_check is 'state'
-        # opponent_state_for_challenge is opponent_state_for_challenge (fetched)
+        # Proceeding message was ephemeral with initial defer, now edit original for public view
+        # No, ctx.defer(ephemeral=False) means the original response is public and can be edited.
+        # The "Proceeding..." message is effectively replaced by the RegionSelect view or an error.
+        # --- Collect Player Mentions and Subs ---
+        all_player_mentions_list = []
+        subs_list_members = [] 
+
+        home_guild_name_for_embed = ctx.guild.name 
+        opponent_guild_name_for_embed = None
+        teams_for_player_collection = []
+
+        # Fetch states again for player collection to ensure freshness, especially for challenges
+        s_initiator = None
+        s_opponent = None
+
+        if active_challenge_for_this_channel:
+            initiator_channel_id = active_challenge_for_this_channel.get("initiating_channel_id")
+            opponent_channel_id = active_challenge_for_this_channel.get("opponent_channel_id")
+            
+            s_initiator = get_channel_state(initiator_channel_id)
+            s_opponent = get_channel_state(opponent_channel_id)
+            
+            # Debug logging for state retrieval
+            print(f"[READY DEBUG] Challenge {active_challenge_for_this_channel.get('challenge_id', 'Unknown')}:")
+            print(f"  - Initiator channel: {initiator_channel_id}, state exists: {s_initiator is not None}")
+            print(f"  - Opponent channel: {opponent_channel_id}, state exists: {s_opponent is not None}")
+            print(f"  - Current channel: {channel_id}, is_initiator: {is_initiator}")
+            
+            # Try to initialize missing states
+            if not s_initiator and initiator_channel_id:
+                try:
+                    initiator_guild_id = active_challenge_for_this_channel.get("initiating_guild_id")
+                    if initiator_guild_id:
+                        s_initiator = await init_state(initiator_guild_id, initiator_channel_id)
+                        print(f"  - Initialized initiator state: {s_initiator is not None}")
+                except Exception as e:
+                    print(f"  - Failed to initialize initiator state: {e}")
+            
+            if not s_opponent and opponent_channel_id:
+                try:
+                    opponent_guild_id = active_challenge_for_this_channel.get("opponent_guild_id")
+                    if opponent_guild_id:
+                        s_opponent = await init_state(opponent_guild_id, opponent_channel_id)
+                        print(f"  - Initialized opponent state: {s_opponent is not None}")
+                except Exception as e:
+                    print(f"  - Failed to initialize opponent state: {e}")
+
+            if s_initiator and s_initiator.get("teams"):
+                teams_for_player_collection.append(s_initiator["teams"][0])
+            if s_opponent and s_opponent.get("teams"):
+                opp_team_idx = 0
+                if s_opponent.get("context_type") in ["main_8s", "main_6s", "main_5s"] and \
+                   len(s_opponent["teams"]) > 1 and \
+                   s_opponent.get("is_challenged_by_team_name"): # Main guild accepted challenge as team 2
+                    opp_team_idx = 1
+                if len(s_opponent["teams"]) > opp_team_idx: # Check index bounds
+                    teams_for_player_collection.append(s_opponent["teams"][opp_team_idx])
+            
+            if s_initiator and s_initiator.get("subs"):
+                subs_list_members.extend(s_initiator.get("subs", []))
+            if s_opponent and s_opponent.get("subs"):
+                subs_list_members.extend(s_opponent.get("subs", []))
+
+            initiator_guild_id = active_challenge_for_this_channel.get("initiating_guild_id")
+            challenger_name_from_data = active_challenge_for_this_channel.get("initiating_team_name")
+            opponent_guild_id = active_challenge_for_this_channel.get("opponent_guild_id")
+            challenged_name_from_data = active_challenge_for_this_channel.get("opponent_team_name")
+
+            guild_obj_initiator = bot.get_guild(initiator_guild_id) if initiator_guild_id else None
+            guild_obj_opponent = bot.get_guild(opponent_guild_id) if opponent_guild_id else None
+
+            # Names for embed based on who ran /ready (ctx.guild)
+            if ctx.guild_id == initiator_guild_id: # Initiator's server ran /ready
+                home_guild_name_for_embed = challenger_name_from_data or (guild_obj_initiator.name if guild_obj_initiator else "Challenger")
+                opponent_guild_name_for_embed = challenged_name_from_data or (guild_obj_opponent.name if guild_obj_opponent else "Opponent")
+            else: # Opponent's server ran /ready
+                home_guild_name_for_embed = challenged_name_from_data or (guild_obj_opponent.name if guild_obj_opponent else "Challenger") # Home is current guild
+                opponent_guild_name_for_embed = challenger_name_from_data or (guild_obj_initiator.name if guild_obj_initiator else "Opponent")
+
+        else: # Standard matchmaking
+            current_channel_full_state = get_channel_state(channel_id) 
+            if current_channel_full_state and current_channel_full_state.get("teams"):
+                teams_for_player_collection.extend(current_channel_full_state.get("teams"))
+            if current_channel_full_state and current_channel_full_state.get("subs"):
+                subs_list_members.extend(current_channel_full_state.get("subs", []))
+            
+            if len(teams_for_player_collection) > 1 : 
+                home_guild_name_for_embed = "Team 1" 
+                opponent_guild_name_for_embed = "Team 2"
+            elif teams_for_player_collection: 
+                home_guild_name_for_embed = channel_context.get("team_name", ctx.guild.name)
+                opponent_guild_name_for_embed = None 
+            else: 
+                home_guild_name_for_embed = ctx.guild.name
+                opponent_guild_name_for_embed = None
         
-        # If current channel is opponent, actual_initiator_state_for_check is 'state_for_readiness_check' (fetched initiator)
-        # opponent_state_for_challenge is 'state' (current channel state)
+        for team_lineup in teams_for_player_collection:
+            for player_data in team_lineup.values():
+                if player_data:
+                    player_obj = player_data['player']
+                    if not is_text_player(player_obj) and hasattr(player_obj, 'mention'):
+                        all_player_mentions_list.append(player_obj.mention)
+                    elif is_text_player(player_obj):
+                        all_player_mentions_list.append(player_obj.display_name)
         
-        # Ensure the variables passed to check_match_readiness are correctly assigned based on 'is_initiator'
-        check_initiator = actual_initiator_state_for_check if not is_initiator else state
-        check_opponent = state if not is_initiator else opponent_state_for_challenge
+        all_player_mentions_list = list(dict.fromkeys(all_player_mentions_list))
+        unique_subs_members = list(dict.fromkeys(subs_list_members)) 
+        mentions_str = " ".join(all_player_mentions_list)
         
-        # Additional validation and debugging
-        print(f"[READY DEBUG] Challenge readiness check:")
-        print(f"  - is_initiator: {is_initiator}")
-        print(f"  - check_initiator exists: {check_initiator is not None}")
-        print(f"  - check_opponent exists: {check_opponent is not None}")
-        print(f"  - check_initiator teams: {len(check_initiator.get('teams', [])) if check_initiator else 0}")
-        print(f"  - check_opponent teams: {len(check_opponent.get('teams', [])) if check_opponent else 0}")
+        # The initial response (from ctx.defer) will be edited to show this view.
+        # We must use RegionSelect.create to correctly build the view with server statuses
+        region_select_view = await RegionSelect.create(
+            fmt=authoritative_game_type, 
+            mentions=mentions_str, 
+            guild_name=home_guild_name_for_embed, 
+            requester=ctx.author, 
+            guild=ctx.guild, 
+            subs=unique_subs_members,
+            opponent_guild_name=opponent_guild_name_for_embed,
+            challenge_data=active_challenge_for_this_channel
+        )
         
-        if not check_initiator:
-             print(f"[READY ERROR] Initiator state missing for challenge {active_challenge_for_this_channel.get('challenge_id', 'Unknown')}")
-             await ctx.interaction.edit_original_response(content="❌ Error: Initiator state data is missing for challenge readiness check.")
-             return
-        if not check_opponent:
-             print(f"[READY ERROR] Opponent state missing for challenge {active_challenge_for_this_channel.get('challenge_id', 'Unknown')}")
-             await ctx.interaction.edit_original_response(content="❌ Error: Opponent state data is missing for challenge readiness check. They may need to use /ready or sign up players.")
-             return
-        are_teams_ready, readiness_message = check_match_readiness(check_initiator, check_opponent, authoritative_game_type)
-    else: # Standard matchmaking (not a challenge, not skipping checks)
-         are_teams_ready, readiness_message = check_match_readiness(actual_initiator_state_for_check, None, authoritative_game_type)
+        await ctx.interaction.edit_original_response(
+            content=f"✅ Match is Ready! {readiness_message}", 
+            view=region_select_view
+        )
 
-    if not are_teams_ready:
-        await ctx.interaction.edit_original_response(content=readiness_message)
-        return
-    
-    # Proceeding message was ephemeral with initial defer, now edit original for public view
-    # No, ctx.defer(ephemeral=False) means the original response is public and can be edited.
-    # The "Proceeding..." message is effectively replaced by the RegionSelect view or an error.
-    # --- Collect Player Mentions and Subs ---
-    all_player_mentions_list = []
-    subs_list_members = [] 
+        # Notify other participant in a challenge
+        if active_challenge_for_this_channel:
+            notification_channel_id = None
+            notification_message = ""
+            current_party_name = challenger_name_from_data if is_initiator else challenged_name_from_data
+            other_party_name = challenged_name_from_data if is_initiator else challenger_name_from_data
 
-    home_guild_name_for_embed = ctx.guild.name 
-    opponent_guild_name_for_embed = None
-    teams_for_player_collection = []
+            if not current_party_name: current_party_name = ctx.guild.name # Fallback for current party
+            
+            if is_initiator: # Current user's channel is initiator, notify opponent
+                notification_channel_id = active_challenge_for_this_channel.get("opponent_channel_id")
+                if not other_party_name: other_party_name = "Your team"
+                notification_message = f"Team **{current_party_name}** (who challenged you) has used `/ready` and is now selecting server/map."
+            else: # Current user's channel is opponent, notify initiator
+                notification_channel_id = active_challenge_for_this_channel.get("initiating_channel_id")
+                if not other_party_name: other_party_name = "The challenging team"
+                notification_message = f"Team **{current_party_name}** (who you challenged) has used `/ready` and is now selecting server/map."
 
-    # Fetch states again for player collection to ensure freshness, especially for challenges
-    s_initiator = None
-    s_opponent = None
-
-    if active_challenge_for_this_channel:
-        initiator_channel_id = active_challenge_for_this_channel.get("initiating_channel_id")
-        opponent_channel_id = active_challenge_for_this_channel.get("opponent_channel_id")
-        
-        s_initiator = get_channel_state(initiator_channel_id)
-        s_opponent = get_channel_state(opponent_channel_id)
-        
-        # Debug logging for state retrieval
-        print(f"[READY DEBUG] Challenge {active_challenge_for_this_channel.get('challenge_id', 'Unknown')}:")
-        print(f"  - Initiator channel: {initiator_channel_id}, state exists: {s_initiator is not None}")
-        print(f"  - Opponent channel: {opponent_channel_id}, state exists: {s_opponent is not None}")
-        print(f"  - Current channel: {channel_id}, is_initiator: {is_initiator}")
-        
-        # Try to initialize missing states
-        if not s_initiator and initiator_channel_id:
-            try:
-                initiator_guild_id = active_challenge_for_this_channel.get("initiating_guild_id")
-                if initiator_guild_id:
-                    s_initiator = await init_state(initiator_guild_id, initiator_channel_id)
-                    print(f"  - Initialized initiator state: {s_initiator is not None}")
-            except Exception as e:
-                print(f"  - Failed to initialize initiator state: {e}")
-        
-        if not s_opponent and opponent_channel_id:
-            try:
-                opponent_guild_id = active_challenge_for_this_channel.get("opponent_guild_id")
-                if opponent_guild_id:
-                    s_opponent = await init_state(opponent_guild_id, opponent_channel_id)
-                    print(f"  - Initialized opponent state: {s_opponent is not None}")
-            except Exception as e:
-                print(f"  - Failed to initialize opponent state: {e}")
-
-        if s_initiator and s_initiator.get("teams"):
-            teams_for_player_collection.append(s_initiator["teams"][0])
-        if s_opponent and s_opponent.get("teams"):
-            opp_team_idx = 0
-            if s_opponent.get("context_type") in ["main_8s", "main_6s"] and \
-               len(s_opponent["teams"]) > 1 and \
-               s_opponent.get("is_challenged_by_team_name"): # Main guild accepted challenge as team 2
-                opp_team_idx = 1
-            if len(s_opponent["teams"]) > opp_team_idx: # Check index bounds
-                teams_for_player_collection.append(s_opponent["teams"][opp_team_idx])
-        
-        if s_initiator and s_initiator.get("subs"):
-            subs_list_members.extend(s_initiator.get("subs", []))
-        if s_opponent and s_opponent.get("subs"):
-            subs_list_members.extend(s_opponent.get("subs", []))
-
-        initiator_guild_id = active_challenge_for_this_channel.get("initiating_guild_id")
-        challenger_name_from_data = active_challenge_for_this_channel.get("initiating_team_name")
-        opponent_guild_id = active_challenge_for_this_channel.get("opponent_guild_id")
-        challenged_name_from_data = active_challenge_for_this_channel.get("opponent_team_name")
-
-        guild_obj_initiator = bot.get_guild(initiator_guild_id) if initiator_guild_id else None
-        guild_obj_opponent = bot.get_guild(opponent_guild_id) if opponent_guild_id else None
-
-        # Names for embed based on who ran /ready (ctx.guild)
-        if ctx.guild_id == initiator_guild_id: # Initiator's server ran /ready
-            home_guild_name_for_embed = challenger_name_from_data or (guild_obj_initiator.name if guild_obj_initiator else "Challenger")
-            opponent_guild_name_for_embed = challenged_name_from_data or (guild_obj_opponent.name if guild_obj_opponent else "Opponent")
-        else: # Opponent's server ran /ready
-            home_guild_name_for_embed = challenged_name_from_data or (guild_obj_opponent.name if guild_obj_opponent else "Challenger") # Home is current guild
-            opponent_guild_name_for_embed = challenger_name_from_data or (guild_obj_initiator.name if guild_obj_initiator else "Opponent")
-
-    else: # Standard matchmaking
-        current_channel_full_state = get_channel_state(channel_id) 
-        if current_channel_full_state and current_channel_full_state.get("teams"):
-            teams_for_player_collection.extend(current_channel_full_state.get("teams"))
-        if current_channel_full_state and current_channel_full_state.get("subs"):
-            subs_list_members.extend(current_channel_full_state.get("subs", []))
-        
-        if len(teams_for_player_collection) > 1 : 
-            home_guild_name_for_embed = "Team 1" 
-            opponent_guild_name_for_embed = "Team 2"
-        elif teams_for_player_collection: 
-            home_guild_name_for_embed = channel_context.get("team_name", ctx.guild.name)
-            opponent_guild_name_for_embed = None 
-        else: 
-            home_guild_name_for_embed = ctx.guild.name
-            opponent_guild_name_for_embed = None
-    
-    for team_lineup in teams_for_player_collection:
-        for player_data in team_lineup.values():
-            if player_data:
-                player_obj = player_data['player']
-                if not is_text_player(player_obj) and hasattr(player_obj, 'mention'):
-                    all_player_mentions_list.append(player_obj.mention)
-                elif is_text_player(player_obj):
-                    all_player_mentions_list.append(player_obj.display_name)
-    
-    all_player_mentions_list = list(dict.fromkeys(all_player_mentions_list))
-    unique_subs_members = list(dict.fromkeys(subs_list_members)) 
-    mentions_str = " ".join(all_player_mentions_list)
-    
-    # The initial response (from ctx.defer) will be edited to show this view.
-    # We must use RegionSelect.create to correctly build the view with server statuses
-    region_select_view = await RegionSelect.create(
-        fmt=authoritative_game_type, 
-        mentions=mentions_str, 
-        guild_name=home_guild_name_for_embed, 
-        requester=ctx.author, 
-        guild=ctx.guild, 
-        subs=unique_subs_members,
-        opponent_guild_name=opponent_guild_name_for_embed,
-        challenge_data=active_challenge_for_this_channel
-    )
-    
-    await ctx.interaction.edit_original_response(
-        content=f"✅ Match is Ready! {readiness_message}", 
-        view=region_select_view
-    )
-
-    # Notify other participant in a challenge
-    if active_challenge_for_this_channel:
-        notification_channel_id = None
-        notification_message = ""
-        current_party_name = challenger_name_from_data if is_initiator else challenged_name_from_data
-        other_party_name = challenged_name_from_data if is_initiator else challenger_name_from_data
-
-        if not current_party_name: current_party_name = ctx.guild.name # Fallback for current party
-        
-        if is_initiator: # Current user's channel is initiator, notify opponent
-            notification_channel_id = active_challenge_for_this_channel.get("opponent_channel_id")
-            if not other_party_name: other_party_name = "Your team"
-            notification_message = f"Team **{current_party_name}** (who challenged you) has used `/ready` and is now selecting server/map."
-        else: # Current user's channel is opponent, notify initiator
-            notification_channel_id = active_challenge_for_this_channel.get("initiating_channel_id")
-            if not other_party_name: other_party_name = "The challenging team"
-            notification_message = f"Team **{current_party_name}** (who you challenged) has used `/ready` and is now selecting server/map."
-
-        if notification_channel_id and notification_message:
-            try:
-                notify_channel_obj = bot.get_channel(notification_channel_id)
-                if notify_channel_obj:
-                    await notify_channel_obj.send(f"📢 Heads up **{other_party_name}**! {notification_message} Please coordinate.")
-            except Exception as e:
-                print(f"[READY DEBUG] Error sending ready notification to other challenge participant: {e}")
+            if notification_channel_id and notification_message:
+                try:
+                    notify_channel_obj = bot.get_channel(notification_channel_id)
+                    if notify_channel_obj:
+                        await notify_channel_obj.send(f"📢 Heads up **{other_party_name}**! {notification_message} Please coordinate.")
+                except Exception as e:
+                    print(f"[READY DEBUG] Error sending ready notification to other challenge participant: {e}")
 
 # Removed handle_ready_logic function - it was deprecated and bypassed by ready_slash
 
@@ -912,13 +904,8 @@ async def finish_standard_match_setup(interaction: discord.Interaction, initial_
 
     team_name_display = "Team 1"
     opponent_display = "Team 2"
-    if context_type in ["team_8s", "team_6s"]:
+    if context_type in ["team_8s", "team_6s", "team_5s"]:
         # This part fetches team data, ensure get_team is available or adjust if not
-        # from ios_bot.database_manager import get_team # Assuming get_team is available
-        # team_data = get_team(guild_id) 
-        # team_name_display = team_data.get("team_name", "Your Team") if team_data else "Your Team"
-        # For simplicity if get_team is problematic to call here, use state's team_name or guild name
-        team_name_display = initial_state.get("team_name", channel.guild.name) # team_name might be in state for team channels
         opponent_display = "CPU/Waiting"
 
     dms_sent_ids = set()
@@ -952,12 +939,10 @@ async def finish_standard_match_setup(interaction: discord.Interaction, initial_
                 pass 
 
     ready_message_id = initial_state.get("ready_message_id")
-    clear_channel_state(channel_id)
-    new_state = await init_state(guild_id, channel_id)
     try:
-        await sm_refresh_lineup(channel, force_new_message=True if not new_state or not new_state.get("lineup_message_id") else False)
+        await clear_and_refresh_channel(channel)
     except Exception as e:
-        print(f"Error refreshing lineup in finish_standard_match_setup: {e}")
+        print(f"Error clearing lineup in finish_standard_match_setup: {e}")
 
     if ready_message_id:
         try:
@@ -979,10 +964,11 @@ async def start_and_clear_challenge_match(
     initiator_name = challenge_data["initiating_team_name"]
     opponent_name = challenge_data.get("opponent_team_name", "Opponent")
     game_type_display = challenge_data["game_type"].upper()
+    challenge_id_to_remove = challenge_data.get("challenge_id")
 
     main_embed = discord.Embed(
         title="⚔️ Challenge Match Starting! ⚔️",
-        description=f"**{initiator_name}** vs **{opponent_name}** ({game_type_display}) is starting on **{server_name}**!",
+        description=f"**{initiator_name}** vs **{opponent_name}** is starting on **{server_name}**!",
         color=discord.Color.gold()
     )
 
@@ -1020,6 +1006,32 @@ async def start_and_clear_challenge_match(
     opponent_channel_id = challenge_data.get("opponent_channel_id")
     opponent_channel = bot.get_channel(opponent_channel_id) if opponent_channel_id else None
     opponent_state = get_channel_state(opponent_channel_id) if opponent_channel_id else None
+
+    # Remove the challenge before lineup refresh so refreshed embeds do not keep stale "vs ..." overlays.
+    challenge_removed = False
+    if challenge_id_to_remove and challenge_id_to_remove in active_challenges:
+        del active_challenges[challenge_id_to_remove]
+        challenge_removed = True
+    else:
+        # Fallback cleanup if the challenge_id key changed or was not populated.
+        for key, value in list(active_challenges.items()):
+            if (
+                value.get("initiating_channel_id") == initiator_channel_id
+                and value.get("opponent_channel_id") == opponent_channel_id
+                and value.get("status") == "accepted"
+            ):
+                del active_challenges[key]
+                challenge_removed = True
+                challenge_id_to_remove = key
+                break
+
+    # Clear challenge flags in channel states before refreshing lineups.
+    for ch_id in filter(None, [initiator_channel_id, opponent_channel_id]):
+        state = get_channel_state(ch_id)
+        if state:
+            state.pop("is_challenged_by_team_name", None)
+            state.pop("active_challenge_game_type", None)
+            update_state(ch_id, state)
 
     # Add Lineups to Embed
     if initiator_state and initiator_state.get("teams"):
@@ -1061,10 +1073,13 @@ async def start_and_clear_challenge_match(
                 except: pass # Ignore DM errors
         except Exception as e:
             print(f"[Challenge Start] Error notifying initiator channel/DMs: {e}")
-        clear_channel_state(initiator_channel_id)
+        try:
+            await clear_and_refresh_channel(initiator_channel)
+        except Exception as e:
+            print(f"[Challenge Start] Error clearing initiator lineup: {e}")
 
     # Notify Opponent's Channel & DM Opponent's Team (including Main Guild)
-    if opponent_channel and opponent_channel_id != MAIN_GUILD_ID:
+    if opponent_channel:
         opponent_mentions = get_all_member_objects_from_state(opponent_state)
         mention_str_opp = " ".join(m.mention for m in opponent_mentions)
         try:
@@ -1074,7 +1089,10 @@ async def start_and_clear_challenge_match(
                 except: pass # Ignore DM errors
         except Exception as e:
             print(f"[Challenge Start] Error notifying opponent channel/DMs: {e}")
-        clear_channel_state(opponent_channel_id)
+        try:
+            await clear_and_refresh_channel(opponent_channel)
+        except Exception as e:
+            print(f"[Challenge Start] Error clearing opponent lineup: {e}")
 
     # Global Announcement
     initiating_channel_mention = initiator_channel.mention if initiator_channel else f"Channel ID: {initiator_channel_id}"
@@ -1090,10 +1108,8 @@ async def start_and_clear_challenge_match(
     except Exception as e:
         print(f"[Challenge Start] Error in announce_match_ready: {e}")
 
-    # Clear challenge from active_challenges
-    challenge_id_to_remove = challenge_data.get("challenge_id")
-    if challenge_id_to_remove and challenge_id_to_remove in active_challenges:
-        del active_challenges[challenge_id_to_remove]
+    # Log cleanup state for traceability.
+    if challenge_removed:
         print(f"Challenge {challenge_id_to_remove} cleared after match start.")
     else:
         print(f"Could not find challenge ID {challenge_id_to_remove} in active_challenges to clear.")
@@ -1102,11 +1118,9 @@ async def start_and_clear_challenge_match(
     if isinstance(interaction_or_channel, discord.Interaction):
         try:
             # Check if message object exists on interaction. If interaction was deferred and then a new message sent,
-            # interaction.message might be None. The MapSelect view is typically on the message that was edited.
             if interaction_or_channel.message: 
                 await interaction_or_channel.message.delete()
         except discord.NotFound:
             pass # Message already deleted
         except Exception as e:
-            # print(f"[Challenge Start] Error deleting original MapSelect message: {e}")
             pass

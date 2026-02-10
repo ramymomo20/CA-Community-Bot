@@ -18,18 +18,9 @@ def check_environment():
         'DISCORD_BOT_TOKEN'
     ]
     
-    # Primary database variables (required)
-    primary_db_vars = [
-        'DB_USER1', 
-        'DB_PASSWORD1',
-        'DB_NAME1'
-    ]
-    
-    # Secondary database variables (optional for failover)
-    secondary_db_vars = [
-        'DB_USER2', 
-        'DB_PASSWORD2',
-        'DB_NAME2'
+    # Database variables (PostgreSQL/Supabase)
+    db_vars = [
+        'SUPABASE_DB_URL',  # Supabase PostgreSQL connection string
     ]
     
     missing = []
@@ -37,37 +28,21 @@ def check_environment():
         if not os.getenv(var):
             missing.append(var)
     
-    # Check primary database
-    primary_missing = []
-    for var in primary_db_vars:
+    # Check database
+    db_missing = []
+    for var in db_vars:
         if not os.getenv(var):
-            primary_missing.append(var)
+            db_missing.append(var)
     
-    # Check secondary database
-    secondary_missing = []
-    secondary_available = True
-    for var in secondary_db_vars:
-        if not os.getenv(var):
-            secondary_missing.append(var)
-            secondary_available = False
-    
-    if missing or primary_missing:
+    if missing or db_missing:
         print("❌ Missing required environment variables:")
-        for var in missing + primary_missing:
+        for var in missing + db_missing:
             print(f"   - {var}")
         print("\nPlease set these environment variables before starting the bot.")
-        print("See ENVIRONMENT_SETUP.md for instructions.")
+        print("Create a .env file with the required variables.")
         return False
     
-    print("✅ Primary database configuration is set.")
-    
-    if secondary_available:
-        print("✅ Secondary database configuration is set (failover enabled).")
-    else:
-        print("⚠️ Secondary database configuration is missing (failover disabled).")
-        if secondary_missing:
-            print("   Missing secondary DB vars:", ", ".join(secondary_missing))
-    
+    print("✅ Database configuration is set.")
     return True
 
 def start_bot_simple():
@@ -131,7 +106,7 @@ def start_bot_with_restarts(max_restarts=3, restart_delay=30):
                 time.sleep(restart_delay)
                 
                 # Increase delay after each restart to prevent rapid reconnections
-                restart_delay = min(restart_delay * 1.5, 300)  # Max 5 minutes
+                restart_delay = min(int(restart_delay * 1.5), 300)  # Max 5 minutes
                 
                 # Clear the imported module to ensure clean restart
                 if 'ios_bot' in sys.modules:
