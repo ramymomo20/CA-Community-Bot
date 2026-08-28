@@ -12,6 +12,7 @@ from .connection import DatabasePool
 from .stats_moderation import ensure_stats_moderation_schema
 from .utils import find_best_match
 from .cache import QueryCache
+from ..hub_sync_signal import request_hub_sync_soon
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class MatchOperations:
         """Call after any write that changes match results/lineups -- wipes
         every cached team-match-history/statistics entry."""
         self._cache.invalidate_prefix("matches:")
+        request_hub_sync_soon("match changed")
 
     async def ensure_stats_moderation_schema(self) -> None:
         async with self.pool.acquire() as conn:
@@ -527,22 +529,35 @@ class MatchOperations:
         match_stats_id: int,
         event_types: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """Fetch stored event-location rows for a match."""
+        """Fetch stored event-location rows for a match (cached until a
+        match write invalidates it)."""
+        cleaned_types = sorted({str(item).strip().lower() for item in (event_types or []) if str(item).strip()})
+        cache_key = f"matches:events:{match_stats_id}:{','.join(cleaned_types)}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return [dict(row) for row in cached]
+
         await self._ensure_match_events_table()
         params: List[Any] = [int(match_stats_id)]
         query = "SELECT * FROM MATCH_EVENTS WHERE match_stats_id = $1"
-        if event_types:
-            cleaned_types = [str(item).strip().lower() for item in event_types if str(item).strip()]
-            if cleaned_types:
-                params.append(cleaned_types)
-                query += " AND event_type = ANY($2::text[])"
+        if cleaned_types:
+            params.append(cleaned_types)
+            query += " AND event_type = ANY($2::text[])"
         query += " ORDER BY COALESCE(match_second, raw_second, 0), event_index"
 
         rows = await self.pool.fetch(query, *params)
-        return [dict(row) for row in rows]
+        result = [dict(row) for row in rows]
+        self._cache.set(cache_key, result)
+        return result
     
     async def get_match(self, match_id: int) -> Optional[Dict[str, Any]]:
-        """Get a match by ID"""
+        """Get a match by ID (cached until a match write invalidates it --
+        a finished match's own stats/lineups never change outside that)."""
+        cache_key = f"matches:by_id:{match_id}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return dict(cached) if cached else None
+
         query = """
         SELECT m.*,
                COALESCE(ht.guild_name, m.home_team_name, tf.home_name_raw) as home_team_name,
@@ -554,12 +569,14 @@ class MatchOperations:
         WHERE m.id = $1
         """
         row = await self.pool.fetchrow(query, match_id)
-        
+
         if row:
             match_data = dict(row)
             match_data['home_lineup'] = json.loads(match_data.get('home_lineup', '[]'))
             match_data['away_lineup'] = json.loads(match_data.get('away_lineup', '[]'))
+            self._cache.set(cache_key, match_data)
             return match_data
+        self._cache.set(cache_key, {})
         return None
     
     async def get_matches_by_team(
@@ -711,7 +728,13 @@ class MatchOperations:
         return matches
     
     async def get_player_match_data(self, match_id: int) -> List[Dict[str, Any]]:
-        """Get all player statistics for a match"""
+        """Get all player statistics for a match (cached until a match
+        write invalidates it)."""
+        cache_key = f"matches:player_data:{match_id}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return [dict(row) for row in cached]
+
         match_id_value = await self._resolve_player_match_id(match_id)
         query = """
         SELECT pmd.*,
@@ -722,7 +745,9 @@ class MatchOperations:
         ORDER BY pmd.goals DESC, pmd.assists DESC
         """
         rows = await self.pool.fetch(query, str(match_id_value))
-        return [dict(row) for row in rows]
+        result = [dict(row) for row in rows]
+        self._cache.set(cache_key, result)
+        return result
     
     async def get_player_stats_summary(
         self,

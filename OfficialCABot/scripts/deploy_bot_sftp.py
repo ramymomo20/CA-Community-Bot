@@ -87,21 +87,30 @@ def upload_path(sftp: paramiko.SFTPClient, local_root: Path, remote_root: str, r
 
 
 def main() -> None:
+    # Login credentials come from the environment, not CLI flags, so they
+    # never show up in a process listing or shell history on the runner.
     parser = argparse.ArgumentParser(description="Deploy bot runtime files over SFTP.")
-    parser.add_argument("--host", required=True)
-    parser.add_argument("--port", type=int, default=2022)
-    parser.add_argument("--username", required=True)
-    parser.add_argument("--password", required=True)
-    parser.add_argument("--remote-path", required=True)
+    parser.add_argument("--host", default=os.environ.get("SPARKED_SERVER_HOST", ""))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("SPARKED_SERVER_PORT") or 2022))
+    parser.add_argument("--remote-path", default=os.environ.get("SPARKED_SERVER_REMOTE_PATH", ""))
     parser.add_argument("--local-root", default=str(Path(__file__).resolve().parents[1]))
     args = parser.parse_args()
+
+    login_name = os.environ.get("SPARKED_SERVER_USERNAME")
+    login_secret = os.environ.get("SPARKED_SERVER_PASSWORD")
+    if not args.host or not login_name or not login_secret or not args.remote_path:
+        raise SystemExit(
+            "Missing connection details: set SPARKED_SERVER_HOST, "
+            "SPARKED_SERVER_USERNAME, SPARKED_SERVER_PASSWORD, and "
+            "SPARKED_SERVER_REMOTE_PATH (or pass --host/--remote-path)."
+        )
 
     local_root = Path(args.local_root).resolve()
     remote_root = args.remote_path.rstrip("/") or "."
 
     host, port = parse_host(args.host, args.port)
     transport = paramiko.Transport((host, port))
-    transport.connect(username=args.username, password=args.password)
+    transport.connect(username=login_name, password=login_secret)
     sftp = paramiko.SFTPClient.from_transport(transport)
 
     try:

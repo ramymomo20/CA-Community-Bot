@@ -336,7 +336,14 @@ async def get_matches():
 
 
 async def get_player_stats_for_match_id(match_id: int, match_id_str: str | None = None):
-    """Get all player stats for a specific match from database."""
+    """Get all player stats for a specific match from database (cached
+    under the shared matches cache, so a match write invalidates it same
+    as every other cached match-detail lookup)."""
+    cache_key = f"matches:view_stats:{match_id}"
+    cached = bot.db.matches._cache.get(cache_key)
+    if cached is not None:
+        return [dict(row) for row in cached]
+
     match_id_value = match_id
     match_id_text_value = match_id_str or str(match_id)
     try:
@@ -493,7 +500,8 @@ async def get_player_stats_for_match_id(match_id: int, match_id_str: str | None 
             'mvp_score': row.get('mvp_score'),
             'mvp_key_stats': _normalize_mvp_key_stats(row.get('mvp_key_stats')),
         })
-    
+
+    bot.db.matches._cache.set(cache_key, result)
     return result
 
 

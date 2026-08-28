@@ -9,6 +9,7 @@ from typing import Optional, List, Dict, Any
 from .utils import find_best_match
 from .connection import DatabasePool
 from .cache import QueryCache
+from ..hub_sync_signal import request_hub_sync_soon
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ class TeamOperations:
 
     def _invalidate_teams_cache(self) -> None:
         self._cache.invalidate_prefix("teams:")
+        request_hub_sync_soon("team changed")
 
     def invalidate_cache(self) -> None:
         """Public entry point for callers outside this class (e.g. the batch

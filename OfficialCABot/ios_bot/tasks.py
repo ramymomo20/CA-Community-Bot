@@ -7,6 +7,7 @@ from ios_bot.signup_manager import (
     refresh_lineup as sm_refresh_lineup,
 )
 from ios_bot.challenge_manager import active_challenges
+from ios_bot.hub_sync_signal import has_pending_request, pending_reason, clear_pending_request
 from pathlib import Path
 import subprocess
 import sys
@@ -46,11 +47,14 @@ hub_incremental_sync_seconds = max(
 hub_sync_enabled = os.getenv("IOSCA_HUB_SYNC_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
 hub_sync_running = False
 # Forced full resync is a safety net to reconcile rows the incremental
-# (updated_at-driven) sync can miss -- most notably deletions. Default
-# bumped 12h -> 24h to cut egress for a ~100-player community; this
-# doubles the worst-case staleness window for deletions specifically.
-# Override via env if that tradeoff isn't right for you.
-hub_force_full_sync_seconds = max(900, int(os.getenv("HUB_FORCE_FULL_SYNC_SECONDS", "86400")))
+# (updated_at-driven) sync can miss -- most notably deletions. Bumped
+# 24h -> 7d: additions/edits no longer depend on this at all now that
+# hub_sync_signal.request_hub_sync_soon() triggers an (incremental) sync
+# within one scheduler tick of any team/match/tournament/player write, so
+# stretching this only affects how long a *deletion* takes to disappear
+# from the Hub -- accepted tradeoff for a ~100-player community's egress
+# budget. Override via env if that tradeoff isn't right for you.
+hub_force_full_sync_seconds = max(900, int(os.getenv("HUB_FORCE_FULL_SYNC_SECONDS", "604800")))
 hub_force_full_sync_last_completed_at = None
 hub_sync_last_completed_at = None
 hub_sync_timezone = pytz.timezone(os.getenv("HUB_SYNC_TIMEZONE", "America/New_York"))
@@ -912,14 +916,26 @@ async def sync_hub_incremental():
     now_local = now_utc.astimezone(hub_sync_timezone)
     active_window = _is_within_hub_sync_active_window(now_local)
 
-    if not active_window and not hub_sync_outside_active_window:
+    # A team/match/tournament/player write just landed and asked for a sync
+    # ahead of schedule -- run on this tick regardless of interval or active
+    # window, instead of making that change wait for the next scheduled poll.
+    requested = has_pending_request()
+
+    if not requested and not active_window and not hub_sync_outside_active_window:
         return
 
-    interval_seconds = _get_hub_sync_interval_seconds(now_local)
-    if hub_sync_last_completed_at is not None:
-        elapsed_seconds = (now_utc - hub_sync_last_completed_at).total_seconds()
-        if elapsed_seconds < interval_seconds:
-            return
+    if not requested:
+        interval_seconds = _get_hub_sync_interval_seconds(now_local)
+        if hub_sync_last_completed_at is not None:
+            elapsed_seconds = (now_utc - hub_sync_last_completed_at).total_seconds()
+            if elapsed_seconds < interval_seconds:
+                return
+
+    if requested:
+        reason = pending_reason()
+        clear_pending_request()
+        if reason:
+            print(f"Hub sync requested early: {reason}")
 
     should_force_full = active_window and _should_force_full_hub_sync(now_utc)
     await _run_hub_sync_once(force_full=should_force_full)

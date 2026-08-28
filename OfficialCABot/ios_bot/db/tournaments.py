@@ -10,6 +10,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timedelta, timezone
 from .connection import DatabasePool
 from .utils import find_best_match, normalize_team_name
+from ..hub_sync_signal import request_hub_sync_soon
 
 logger = logging.getLogger(__name__)
 
@@ -415,7 +416,7 @@ class TournamentOperations:
         RETURNING id
         """
         try:
-            return await self.pool.fetchval(
+            tournament_id = await self.pool.fetchval(
                 query,
                 name,
                 format,
@@ -426,6 +427,8 @@ class TournamentOperations:
                 points_loss,
                 league_count,
             )
+            request_hub_sync_soon("tournament created")
+            return tournament_id
         except Exception as e:
             logger.error(f"Failed to create tournament: {e}")
             return None
@@ -451,6 +454,7 @@ class TournamentOperations:
                 "UPDATE TOURNAMENTS SET status = 'ended' WHERE id = $1",
                 tournament_id
             )
+            request_hub_sync_soon("tournament ended")
             return True
         except Exception as e:
             logger.error(f"Failed to end tournament {tournament_id}: {e}")
@@ -510,6 +514,7 @@ class TournamentOperations:
                     after = await conn.fetchval(
                         "SELECT count(*) FROM TOURNAMENT_TEAMS WHERE tournament_id = $1", tournament_id
                     )
+            request_hub_sync_soon("tournament teams changed")
             return max(0, after - before)
         except Exception as e:
             logger.error(f"Failed to batch-add teams to tournament {tournament_id}: {e}")
@@ -860,6 +865,8 @@ class TournamentOperations:
                         )
                 added = max(0, after - before)
                 skipped = len(fixture_params) - added
+                if added:
+                    request_hub_sync_soon("tournament fixtures changed")
             except Exception as e:
                 logger.error(f"Failed to batch-insert fixtures for tournament {tournament_id}: {e}")
                 skipped = len(fixture_params)
@@ -1520,6 +1527,7 @@ class TournamentOperations:
         except Exception as e:
             logger.error(f"Failed to mark forfeited fixture as played ({fixture_id}): {e}")
             return False
+        request_hub_sync_soon("tournament forfeit recorded")
         return True
 
     async def add_draw(
@@ -1563,6 +1571,7 @@ class TournamentOperations:
         except Exception as e:
             logger.error(f"Failed to mark drawn fixture as played ({fixture_id}): {e}")
             return False
+        request_hub_sync_soon("tournament draw recorded")
         return True
 
     async def _mark_fixture_played_for_match(
@@ -2003,6 +2012,7 @@ class TournamentOperations:
         )
 
         await self._apply_match_to_player_stats(tournament_id, match, home_id, away_id)
+        request_hub_sync_soon("tournament match result recorded")
         return True
 
     async def _apply_match_to_player_stats(self, tournament_id: int, match: Dict[str, Any], home_id: int, away_id: int):

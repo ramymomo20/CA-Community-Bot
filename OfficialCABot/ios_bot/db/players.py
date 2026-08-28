@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from .connection import DatabasePool
 from .cache import QueryCache
+from ..hub_sync_signal import request_hub_sync_soon
 
 logger = logging.getLogger(__name__)
 ID64_BASE = 76561197960265728
@@ -99,6 +100,7 @@ class PlayerOperations:
         """Called after any ratings write, including bulk recalculation
         jobs that write via their own SQL outside this class."""
         self._cache.invalidate_prefix("players:")
+        request_hub_sync_soon("player changed")
 
     async def _discord_id_expects_text(self) -> bool:
         """Detect whether IOSCA_PLAYERS.discord_id is stored as text."""
