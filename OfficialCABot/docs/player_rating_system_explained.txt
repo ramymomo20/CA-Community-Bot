@@ -1,0 +1,82 @@
+IOSCA Player Rating System Explained
+====================================
+
+This document reflects the current canonical rating model.
+
+There are two rating layers:
+
+1. Match rating
+   A single-game performance score used for match pages, MVP selection, and player-of-the-match context.
+
+2. Long-term player rating
+   A stored rating that represents the player over time on the 5.0 to 9.9 scale.
+
+Part 1: Source data
+-------------------
+The rating pipeline reads canonical match data from:
+
+- core.matches
+- core.match_player_entries
+- core.match_events
+
+Per-player match entries include data such as:
+
+- goals
+- assists
+- second assists
+- shots
+- shots on target
+- passes completed
+- passes attempted
+- chances created
+- key passes
+- interceptions
+- tackles
+- tackles completed
+- fouls committed
+- fouls suffered
+- yellow cards
+- second yellow reds
+- red cards
+- saves
+- saves caught
+- goals conceded
+- offsides
+- own goals
+- seconds played
+- positional seconds across attack, midfield, defense, and goalkeeper
+- distance covered
+- clutch actions
+- substitution impact
+
+Part 2: Stored outputs
+----------------------
+The ratings process writes to:
+
+- core.rating_runs
+- core.player_ratings_current
+- core.player_rating_snapshots
+- core.team_ratings_current
+- core.team_rating_snapshots
+
+Part 3: Identity rules
+----------------------
+The system is account-first:
+
+- one real person should map to one core.accounts row
+- multiple Discord accounts can be linked through core.account_discord_identities
+- multiple Steam accounts can be linked through core.account_steam_identities
+- the displayed rating belongs to the account, not to an individual Steam alias
+
+Part 4: Hub publication
+-----------------------
+The public hub should read summary data from:
+
+- hub.player_summaries
+- hub.player_profiles
+- hub.team_summaries
+- hub.team_profiles
+- hub.match_summaries
+- hub.match_details
+
+The hub should not recalculate ratings on page load.

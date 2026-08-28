@@ -1,0 +1,126 @@
+[
+  {
+    "table_name": "active_challenges",
+    "columns": "challenge_id character varying not null\nchallenger_guild_id bigint not null\nchallenged_guild_id bigint\nchannel_type character varying not null\nstatus character varying not null\nchallenger_lineup jsonb not null\nchallenged_lineup jsonb\ncreated_at timestamp without time zone not null default now()\nexpires_at timestamp without time zone not null"
+  },
+  {
+    "table_name": "active_match_contexts",
+    "columns": "id bigint not null default nextval('active_match_contexts_id_seq'::regclass)\nprimary_channel_id bigint not null\nsecondary_channel_id bigint\nteam1_name character varying not null\nteam2_name character varying not null\nteam1_name_norm text not null\nteam2_name_norm text not null\nteam1_guild_id bigint\nteam2_guild_id bigint\ngame_type character varying\nsource_kind character varying not null default 'standard'::character varying\nmatch_stats_id integer\ncreated_at timestamp without time zone default now()\nfinished_at timestamp without time zone\ntournament_id integer\nfixture_id integer\nschedule_id integer"
+  },
+  {
+    "table_name": "counted_match_stats",
+    "columns": "id integer\nmatch_id character varying\ndatetime timestamp without time zone\nhome_guild_id bigint\naway_guild_id bigint\nhome_score integer\naway_score integer\ngame_type character varying\nhome_lineup jsonb\naway_lineup jsonb\nsubstitutions jsonb\nextratime boolean\npenalties boolean\ncreated_at timestamp without time zone\nupdated_at timestamp without time zone\nhome_team_name character varying\naway_team_name character varying\nsource_filename text\nmatch_summary_home jsonb\nmatch_summary_away jsonb\ncomeback_flag boolean"
+  },
+  {
+    "table_name": "counted_player_match_data",
+    "columns": "id integer\nmatch_id character varying\nsteam_id character varying\nguild_id bigint\nposition character varying\ngoals integer\nassists integer\nsecond_assists integer\nshots integer\nshots_on_goal integer\npasses_completed integer\npasses_attempted integer\nchances_created integer\nkey_passes integer\ninterceptions integer\ntackles integer\nsliding_tackles_completed integer\nfouls integer\nyellow_cards integer\nred_cards integer\nkeeper_saves integer\nkeeper_saves_caught integer\ngoals_conceded integer\noffsides integer\nown_goals integer\ntime_played integer\ntime_gk integer\ntime_def integer\ntime_mid integer\ntime_att integer\ndistance_covered numeric\npass_accuracy numeric\ncreated_at timestamp without time zone\nupdated_at timestamp without time zone\nfouls_suffered integer\nfree_kicks integer\npenalties integer\ncorners integer\nthrow_ins integer\ngoal_kicks integer\npossession numeric\nevent_timestamps jsonb\nplayer_name character varying\nstatus character varying\nclutch_actions jsonb\nsub_impact jsonb\nguild_team_name character varying\nmatch_rating numeric\nis_match_mvp boolean\nmvp_score numeric\nmvp_key_stats jsonb"
+  },
+  {
+    "table_name": "ios_servers",
+    "columns": "id integer not null default nextval('ios_servers_id_seq'::regclass)\nname character varying not null\naddress character varying not null\npassword character varying not null\nsftp_ip character varying\nhost_username character varying\nhost_password character varying\nserver_type character varying default 'linux'::character varying\nis_active boolean default true\ncreated_at timestamp without time zone default now()\nupdated_at timestamp without time zone default now()"
+  },
+  {
+    "table_name": "iosca_players",
+    "columns": "steam_id character varying not null\ndiscord_id character varying\ndiscord_name character varying not null\nrating numeric default 5.0\nrating_updated_at timestamp without time zone default now()\nregistered_at timestamp without time zone default now()\nlast_active timestamp without time zone default now()\nupdated_at timestamp without time zone default now()\nlinked_steam_ids jsonb not null default '[]'::jsonb\ntotal_appearances integer not null default 0\ntotal_minutes integer not null default 0\natk_rating numeric\nmid_rating numeric\ndef_rating numeric\ngk_rating numeric\natk_appearances integer not null default 0\nmid_appearances integer not null default 0\ndef_appearances integer not null default 0\ngk_appearances integer not null default 0\natk_minutes integer not null default 0\nmid_minutes integer not null default 0\ndef_minutes integer not null default 0\ngk_minutes integer not null default 0\nmain_role character varying\nmain_role_rating numeric\ndisplay_main_role_rating numeric\nlast_match_at timestamp without time zone"
+  },
+  {
+    "table_name": "iosca_teams",
+    "columns": "guild_id bigint not null\nguild_name character varying not null\nguild_icon text\ncaptain_id bigint not null\ncaptain_name character varying not null\nplayers jsonb default '[]'::jsonb\neights_channels jsonb default '[]'::jsonb\nsixes_channels jsonb default '[]'::jsonb\nis_national_team boolean default false\nis_mix_team boolean default false\naverage_rating numeric default 5.0\ncreated_at timestamp without time zone default now()\nupdated_at timestamp without time zone default now()\nfives_channels jsonb default '[]'::jsonb\npress_channel_id bigint\nvice_captain_ids jsonb not null default '[]'::jsonb"
+  },
+  {
+    "table_name": "main_discord",
+    "columns": "id integer not null default nextval('main_discord_id_seq'::regclass)\nguild_id bigint not null\nguild_name character varying not null\nsixes_channels jsonb default '[]'::jsonb\neights_channels jsonb default '[]'::jsonb\nresults_channel bigint\nadmin_role_id bigint\nteam_leader_role_id bigint\ncreated_at timestamp without time zone default now()\nupdated_at timestamp without time zone default now()\nfixtures_channel jsonb default '[]'::jsonb\nfives_channels jsonb default '[]'::jsonb\nconfirmed_channel jsonb\ncaptains_channel jsonb"
+  },
+  {
+    "table_name": "match_events",
+    "columns": "id bigint not null default nextval('match_events_id_seq'::regclass)\nmatch_stats_id integer not null\nmatch_id character varying not null\nevent_index integer not null\nevent_type character varying not null\nraw_event character varying\nteam character varying\nperiod character varying\nraw_second integer\nmatch_second integer\nminute integer\nclock character varying\nplayer1_steam_id character varying\nplayer2_steam_id character varying\nplayer3_steam_id character varying\nbody_part integer\nx double precision\ny double precision\nnorm_x double precision\nnorm_y double precision\nfield_min_x double precision\nfield_min_y double precision\nfield_max_x double precision\nfield_max_y double precision\nraw_event_payload jsonb not null default '{}'::jsonb\ncreated_at timestamp without time zone default now()"
+  },
+  {
+    "table_name": "match_import_skips",
+    "columns": "match_id text not null\nfilename text\nreason text\nmatch_datetime timestamp without time zone\nskipped_at timestamp without time zone default now()"
+  },
+  {
+    "table_name": "match_stats",
+    "columns": "id integer not null default nextval('match_stats_id_seq'::regclass)\nmatch_id character varying not null\ndatetime timestamp without time zone not null\nhome_guild_id bigint\naway_guild_id bigint\nhome_score integer not null default 0\naway_score integer not null default 0\ngame_type character varying not null\nhome_lineup jsonb default '[]'::jsonb\naway_lineup jsonb default '[]'::jsonb\nsubstitutions jsonb default '[]'::jsonb\nextratime boolean default false\npenalties boolean default false\ncreated_at timestamp without time zone default now()\nupdated_at timestamp without time zone default now()\nhome_team_name character varying\naway_team_name character varying\nsource_filename text\nmatch_summary_home jsonb not null default '[]'::jsonb\nmatch_summary_away jsonb not null default '[]'::jsonb\ncomeback_flag boolean not null default false"
+  },
+  {
+    "table_name": "match_stats_exclusions",
+    "columns": "match_stats_id integer not null\nexclude_from_stats boolean not null default true\nreason text\nupdated_by_discord_id bigint\ncreated_at timestamp without time zone not null default now()\nupdated_at timestamp without time zone not null default now()"
+  },
+  {
+    "table_name": "player_account_discord_ids",
+    "columns": "account_discord_id bigint not null default nextval('player_account_discord_ids_account_discord_id_seq'::regclass)\naccount_id bigint not null\ndiscord_id character varying not null\nis_primary boolean not null default false\nverified_at timestamp without time zone\ncreated_at timestamp without time zone not null default now()\nupdated_at timestamp without time zone not null default now()"
+  },
+  {
+    "table_name": "player_account_steam_ids",
+    "columns": "account_steam_id bigint not null default nextval('player_account_steam_ids_account_steam_id_seq'::regclass)\naccount_id bigint not null\nsteam_id character varying not null\nsteam_id_64 character varying\nis_primary boolean not null default false\nverified_at timestamp without time zone\ncreated_at timestamp without time zone not null default now()\nupdated_at timestamp without time zone not null default now()"
+  },
+  {
+    "table_name": "player_accounts",
+    "columns": "account_id bigint not null default nextval('player_accounts_account_id_seq'::regclass)\nhub_user_id bigint\ndisplay_name character varying\ncreated_at timestamp without time zone not null default now()\nupdated_at timestamp without time zone not null default now()"
+  },
+  {
+    "table_name": "player_match_data",
+    "columns": "id integer not null default nextval('player_match_data_id_seq'::regclass)\nmatch_id character varying not null\nsteam_id character varying not null\nguild_id bigint\nposition character varying\ngoals integer default 0\nassists integer default 0\nsecond_assists integer default 0\nshots integer default 0\nshots_on_goal integer default 0\npasses_completed integer default 0\npasses_attempted integer default 0\nchances_created integer default 0\nkey_passes integer default 0\ninterceptions integer default 0\ntackles integer default 0\nsliding_tackles_completed integer default 0\nfouls integer default 0\nyellow_cards integer default 0\nred_cards integer default 0\nkeeper_saves integer default 0\nkeeper_saves_caught integer default 0\ngoals_conceded integer default 0\noffsides integer default 0\nown_goals integer default 0\ntime_played integer default 0\ntime_gk integer default 0\ntime_def integer default 0\ntime_mid integer default 0\ntime_att integer default 0\ndistance_covered numeric default 0\npass_accuracy numeric default 0\ncreated_at timestamp without time zone default now()\nupdated_at timestamp without time zone default now()\nfouls_suffered integer default 0\nfree_kicks integer default 0\npenalties integer default 0\ncorners integer default 0\nthrow_ins integer default 0\ngoal_kicks integer default 0\npossession numeric default 0\nevent_timestamps jsonb not null default '{}'::jsonb\nplayer_name character varying\nstatus character varying\nclutch_actions jsonb not null default '[]'::jsonb\nsub_impact jsonb not null default '{}'::jsonb\nguild_team_name character varying\nmatch_rating numeric\nis_match_mvp boolean not null default false\nmvp_score numeric\nmvp_key_stats jsonb not null default '[]'::jsonb"
+  },
+  {
+    "table_name": "player_match_rating_timeline",
+    "columns": "player_match_data_id integer\nsteam_id character varying\nplayer_name character varying\nmatch_id character varying\nmatch_stats_id integer\nmatch_datetime timestamp without time zone\nguild_id bigint\nguild_team_name character varying\nposition character varying\nstatus character varying\nmatch_rating numeric\nis_match_mvp boolean\nprevious_match_rating numeric\nmatch_rating_delta numeric\nrolling_5_match_rating numeric"
+  },
+  {
+    "table_name": "player_match_stat_exclusions",
+    "columns": "match_stats_id integer not null\nsteam_id character varying not null\nexclude_from_stats boolean not null default true\nreason text\nupdated_by_discord_id bigint\ncreated_at timestamp without time zone not null default now()\nupdated_at timestamp without time zone not null default now()"
+  },
+  {
+    "table_name": "player_rating_history",
+    "columns": "id bigint not null default nextval('player_rating_history_id_seq'::regclass)\nsteam_id character varying not null\nplayer_name character varying\nrating numeric\natk_rating numeric\nmid_rating numeric\ndef_rating numeric\ngk_rating numeric\nmain_role character varying\nmain_role_rating numeric\ndisplay_main_role_rating numeric\ntotal_appearances integer\ntotal_minutes integer\nlast_match_at timestamp without time zone\nformula_version character varying not null default 'role_based_v1'::character varying\nsource character varying not null default 'ratings_rebuild'::character varying\nrating_run_at timestamp without time zone not null default now()\ncreated_at timestamp without time zone not null default now()"
+  },
+  {
+    "table_name": "player_rating_timeline",
+    "columns": "id bigint\nsteam_id character varying\nplayer_name character varying\nrating numeric\natk_rating numeric\nmid_rating numeric\ndef_rating numeric\ngk_rating numeric\nmain_role character varying\nmain_role_rating numeric\ndisplay_main_role_rating numeric\ntotal_appearances integer\ntotal_minutes integer\nlast_match_at timestamp without time zone\nformula_version character varying\nsource character varying\nrating_run_at timestamp without time zone\ncreated_at timestamp without time zone\nprevious_display_main_role_rating numeric\ndisplay_rating_delta numeric"
+  },
+  {
+    "table_name": "player_registration_intents",
+    "columns": "intent_id bigint not null default nextval('player_registration_intents_intent_id_seq'::regclass)\ndiscord_id character varying not null\ndiscord_name character varying\nguild_id character varying\ntoken_hash character not null\nexpires_at timestamp without time zone not null\nused_at timestamp without time zone\nconsumed_by_hub_user_id bigint\ncreated_at timestamp without time zone not null default now()"
+  },
+  {
+    "table_name": "server_assets",
+    "columns": "id integer not null default nextval('server_assets_id_seq'::regclass)\nguild_id bigint not null default get_default_main_guild_id()\nasset_type character varying not null\nasset_key character varying not null\ndiscord_id character varying not null\nasset_name character varying\nraw_value character varying\ncreated_by bigint\ncreated_at timestamp without time zone default now()\nupdated_at timestamp without time zone default now()"
+  },
+  {
+    "table_name": "team_lineups",
+    "columns": "guild_id bigint not null\nchannel_id bigint not null\ncontext_type character varying\nlineup jsonb not null default '{}'::jsonb\nupdated_at timestamp without time zone default now()"
+  },
+  {
+    "table_name": "team_name_aliases",
+    "columns": "id bigint not null default nextval('team_name_aliases_id_seq'::regclass)\nalias_name text not null\nalias_norm text\nguild_id bigint not null\ncreated_at timestamp with time zone not null default now()\nupdated_at timestamp with time zone not null default now()"
+  },
+  {
+    "table_name": "team_stats_summary",
+    "columns": "guild_id bigint\nguild_name character varying\ncaptain_name character varying\naverage_rating numeric\nhome_matches bigint\naway_matches bigint\ntotal_matches bigint\ngoals_scored bigint\ngoals_conceded bigint\nwins bigint\ndraws bigint\nlosses bigint"
+  },
+  {
+    "table_name": "tournament_fixtures",
+    "columns": "id integer not null default nextval('tournament_fixtures_id_seq'::regclass)\ntournament_id integer not null\nweek_number integer\nweek_label text\nhome_guild_id bigint\naway_guild_id bigint\nhome_name_raw text\naway_name_raw text\ncreated_at timestamp without time zone default now()\nis_active boolean not null default true\nis_played boolean not null default false\nplayed_match_stats_id integer\nplayed_at timestamp without time zone\nis_draw_home boolean not null default false\nis_draw_away boolean not null default false\nis_forfeit_home boolean not null default false\nis_forfeit_away boolean not null default false\nforfeit_score integer not null default 10\nresult_set_by bigint\nresult_set_at timestamp without time zone\nleague_key character varying not null default 'A'::character varying\nstage_type character varying not null default 'league'::character varying\nround_number integer\nbracket_slot integer\nhome_source text\naway_source text\nwinner_guild_id bigint\nwinner_to_fixture_id integer\nloser_to_fixture_id integer"
+  },
+  {
+    "table_name": "tournament_schedules",
+    "columns": "id integer not null default nextval('tournament_schedules_id_seq'::regclass)\ntournament_id integer not null\nfixture_id integer not null\nproposed_by bigint\nproposed_time timestamp without time zone not null\nslot_start timestamp without time zone not null\nserver_name text\nstatus text not null default 'pending'::text\nlast_action_by bigint\nconfirmed_at timestamp without time zone\nreminder_sent_at timestamp without time zone\ncreated_at timestamp without time zone default now()\nupdated_at timestamp without time zone default now()\nproposal_expires_at timestamp without time zone\nproposal_message_ids jsonb default '{}'::jsonb"
+  },
+  {
+    "table_name": "tournament_standings",
+    "columns": "tournament_id integer not null\nguild_id bigint not null\nwins integer not null default 0\ndraws integer not null default 0\nlosses integer not null default 0\ngoals_for integer not null default 0\ngoals_against integer not null default 0\ngoal_diff integer not null default 0\npoints integer not null default 0\nmatches_played integer not null default 0\nupdated_at timestamp without time zone default now()"
+  },
+  {
+    "table_name": "tournament_teams",
+    "columns": "id integer not null default nextval('tournament_teams_id_seq'::regclass)\ntournament_id integer not null\nguild_id bigint\nteam_name_snapshot character varying not null\nteam_icon_snapshot character varying\nseed integer\nleague_key character varying not null default 'A'::character varying"
+  },
+  {
+    "table_name": "tournaments",
+    "columns": "id integer not null default nextval('tournaments_id_seq'::regclass)\nname character varying not null\nformat character varying not null\nstatus character varying not null default 'active'::character varying\nnum_teams integer not null\npoints_win integer not null default 3\npoints_draw integer not null default 1\npoints_loss integer not null default 0\ncreated_by bigint\ncreated_at timestamp without time zone default now()\nupdated_at timestamp without time zone default now()\nleague_count integer not null default 1"
+  },
+  {
+    "table_name": "v_match_player_performance",
+    "columns": "id integer\nmatch_id character varying\nsteam_id character varying\nguild_id bigint\nplayer_name character varying\nposition character varying\nstatus character varying\nmatch_rating numeric\nis_match_mvp boolean\nmvp_score numeric\nmvp_key_stats jsonb\nupdated_at timestamp without time zone"
+  }
+]

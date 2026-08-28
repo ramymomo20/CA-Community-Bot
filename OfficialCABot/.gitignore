@@ -1,0 +1,58 @@
+# Environment variables (contains sensitive information)
+.env
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+*.log
+
+# Bot-specific files that might contain sensitive data
+*.token
+*.key
+config_local.py
+
+# Temporary files
+*.tmp
+*.temp 
+
+#main ignore files
+batch_register_players.csv
+DEPLOY_EDGE_FUNCTION.md
+parser_match.py
+schema.txt
+
+/scripts
+/supabase
+/iosca_flask_app
+/csv_output
+/runtime/
+/.deploy_stage/
+
+# Independent git repo with its own remote/history - never nest as a gitlink here
+/ioscahub.github.io/
+
+# Separate, unrelated project living in this folder temporarily - not part of the bot
+/strikers_club_ca/
+
+# Claude Code local tooling state
+/.claude/

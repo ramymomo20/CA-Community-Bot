@@ -1,0 +1,590 @@
+Yes. The main constraint is this:
+
+A GitHub Pages frontend should never connect directly to MySQL.
+Use either:
+1. a backend API in front of MySQL, or
+2. a build pipeline that reads MySQL and generates JSON files the site consumes.
+
+For your project, the cleanest long-term setup is:
+
+- MySQL as source of truth
+- Python service/scripts for ingest, validation, summaries, and exports
+- media stored outside MySQL
+- frontend consuming either API responses or generated JSON shaped like your current mock data
+
+**What To Store**
+Split the database into 4 layers:
+
+1. Core entities
+- `players`
+- `teams`
+- `team_memberships`
+- `competitions`
+- `competition_seasons`
+- `matches`
+- `match_lineups`
+- `match_player_stats`
+- `match_events`
+- `media_assets`
+
+2. Raw match facts
+- who played
+- where they played
+- what happened
+- every stat line
+- every event timestamp
+- every shot coordinate
+
+3. Derived summaries
+- player totals
+- team totals
+- standings
+- rankings
+- records
+- head-to-head summaries
+- shot-zone aggregates
+
+4. Presentation payloads
+- page-ready JSON or SQL views shaped like your widgets
+
+**Recommended Core Tables**
+
+`players`
+- `id`
+- `display_name`
+- `short_name`
+- `steam_id`
+- `steam_profile_url`
+- `discord_user_id`
+- `avatar_url`
+- `nationality_code`
+- `primary_position`
+- `is_active`
+- `created_at`
+
+`teams`
+- `id`
+- `name`
+- `short_name`
+- `crest_url`
+- `primary_color`
+- `secondary_color`
+- `captain_player_id`
+- `created_at`
+- `is_active`
+
+`team_memberships`
+- `id`
+- `team_id`
+- `player_id`
+- `start_date`
+- `end_date`
+- `role`
+- `shirt_number`
+
+This is important because players can change teams.
+
+`competitions`
+- `id`
+- `name`
+- `slug`
+- `type` (`league`, `cup`, `playoff`)
+- `format` (`5v5`, `6v6`, `8v8`)
+- `logo_url`
+- `status`
+
+`competition_seasons`
+- `id`
+- `competition_id`
+- `season_name`
+- `start_date`
+- `end_date`
+- `status`
+
+`competition_entries`
+- `id`
+- `competition_season_id`
+- `team_id`
+- `group_name`
+- `seed`
+
+`matches`
+- `id`
+- `competition_season_id`
+- `stage_name`
+- `home_team_id`
+- `away_team_id`
+- `scheduled_at`
+- `started_at`
+- `ended_at`
+- `status`
+- `format`
+- `home_score`
+- `away_score`
+- `went_et`
+- `went_pens`
+- `is_comeback`
+- `winner_team_id`
+- `mvp_player_id`
+
+`match_lineups`
+- `id`
+- `match_id`
+- `team_id`
+- `player_id`
+- `position_code`
+- `slot_order`
+- `x_pct`
+- `y_pct`
+- `started`
+- `is_captain`
+- `is_mvp`
+
+Store `x_pct` and `y_pct`. That makes the lineup widget easy forever.
+
+`match_player_stats`
+- `id`
+- `match_id`
+- `team_id`
+- `player_id`
+- `position_code`
+- `rating`
+- `goals`
+- `shots`
+- `shots_on_target`
+- `assists`
+- `second_assists`
+- `key_passes`
+- `chances_created`
+- `passes`
+- `passes_completed`
+- `pass_completion_pct`
+- `interceptions`
+- `possessions`
+- `saves`
+- `offsides`
+- `distance_km`
+- `fouls`
+- `fouls_suffered`
+- `own_goals`
+- `goals_conceded`
+- `corners`
+- `throw_ins`
+- `free_kicks`
+- `goal_kicks`
+- `penalties`
+- `yellow_cards`
+- `second_yellow_reds`
+- `red_cards`
+
+This table powers almost everything.
+
+`match_events`
+- `id`
+- `match_id`
+- `team_id`
+- `player_id`
+- `assist_player_id`
+- `secondary_player_id`
+- `minute`
+- `second`
+- `event_type`
+- `subtype`
+- `is_own_goal`
+- `notes`
+
+Event types:
+- `goal`
+- `save`
+- `miss`
+- `yellow_card`
+- `second_yellow`
+- `red_card`
+- `own_goal`
+- `substitution`
+- `penalty_scored`
+- `penalty_missed`
+
+`match_shots`
+- `id`
+- `match_id`
+- `team_id`
+- `player_id`
+- `minute`
+- `x_pct`
+- `y_pct`
+- `result_type`
+- `assist_player_id`
+- `body_part`
+- `is_penalty`
+
+This powers shot map and shot zones.
+
+`media_assets`
+- `id`
+- `uploader_player_id`
+- `competition_season_id`
+- `match_id`
+- `team_id`
+- `player_id`
+- `media_type` (`goal_clip`, `highlight`, `screenshot`, `compilation`)
+- `title`
+- `description`
+- `storage_key`
+- `public_url`
+- `thumbnail_url`
+- `duration_seconds`
+- `file_size_bytes`
+- `mime_type`
+- `created_at`
+- `is_public`
+
+`media_tags`
+- `id`
+- `asset_id`
+- `tag`
+
+**Do Not Store Images/Videos In MySQL**
+Do not use MySQL blobs for this.
+
+Use:
+- Cloudflare R2
+- AWS S3
+- Backblaze B2
+
+Store only:
+- `public_url`
+- `thumbnail_url`
+- `storage_key`
+- metadata
+
+For video:
+- store original upload
+- generate thumbnail
+- generate web-playable mp4/hls
+- serve through CDN
+
+For images:
+- keep original
+- generate optimized sizes
+- keep thumbnail URL
+
+**Best Data Flow**
+Use this pattern:
+
+Raw input
+- admin panel / parser / bot / manual import
+
+Writes to
+- MySQL normalized tables
+
+Python jobs compute
+- standings
+- summaries
+- rankings
+- records
+- form
+- head-to-head
+- shot-zone aggregates
+
+Then expose to site through:
+- API JSON, or
+- static JSON export
+
+**Best Page-Facing Views / Summary Tables**
+MySQL views are useful, but for heavy pages I would also use summary tables.
+
+Use raw tables for truth.
+Use views for readable joins.
+Use summary tables for expensive widgets.
+
+Recommended views:
+
+`v_player_current_team`
+- player + active team + crest + team colors
+
+`v_player_totals`
+- summed career or season stats
+
+`v_team_totals`
+- aggregated team totals
+
+`v_match_overview`
+- match hero payload
+- team names
+- logos
+- flags
+- mvp
+- score
+- metadata
+
+`v_match_event_feed`
+- flattened event timeline rows
+
+`v_match_lineup_cards`
+- lineup rows with player identity + stats + x/y
+
+`v_competition_standings_base`
+- played
+- wins
+- draws
+- losses
+- gf
+- ga
+- gd
+- points
+
+`v_player_rankings`
+- by overall rating
+- goals
+- assists
+- saves
+- interceptions
+- pass accuracy
+
+`v_team_rankings`
+- avg rating
+- win rate
+- form
+- goal difference
+- points per match
+
+`v_head_to_head_team`
+- meetings
+- wins
+- draws
+- goals for/against
+- latest meeting
+
+`v_head_to_head_player`
+- side-by-side aggregates
+
+Recommended summary tables:
+
+`player_season_summary`
+`team_season_summary`
+`competition_standings_snapshot`
+`player_form_last_5`
+`team_form_last_5`
+`records_snapshot`
+`shot_zone_summary`
+
+Why summary tables:
+- rankings, records, standings, and shot zones should not be recalculated on every request
+
+**Important: MySQL “Views” vs Real Performance**
+MySQL views are not materialized.
+So for expensive pages:
+- use views for logic clarity
+- use scheduled summary tables for performance
+
+A good approach:
+- raw tables
+- SQL view for canonical query
+- Python job writes final results into summary table
+
+**What The Frontend Actually Needs**
+Your frontend mostly wants page-shaped payloads.
+
+Example `match detail` payload:
+```json
+{
+  "id": 251497,
+  "competition": "IOSCA Champions Cup Final",
+  "format": "5v5",
+  "date": "2026-05-10",
+  "time": "20:30:00",
+  "status": "Final",
+  "flags": ["ET", "COMEBACK"],
+  "homeTeam": {},
+  "awayTeam": {},
+  "mvp": {},
+  "lineups": {
+    "home": [],
+    "away": []
+  },
+  "events": [],
+  "shots": [],
+  "shotZones": {
+    "home": [],
+    "away": []
+  },
+  "comparison": {},
+  "playerStats": {
+    "home": [],
+    "away": []
+  }
+}
+```
+
+That means your backend/export layer should transform normalized SQL into this shape.
+
+**What To Aggregate Per Page**
+
+Home page:
+- latest featured match
+- latest tournament
+- top 3 players
+- quick stats
+- recent results
+- team of week
+
+Players page:
+- searchable player directory
+- current rating
+- current team
+- appearances
+- mvps
+
+Player profile:
+- identity
+- current team
+- season summary
+- rating history
+- activity heatmap
+- records
+- match logs
+- tournament history
+
+Teams page:
+- current rating
+- current form
+- record
+- player count
+- competition
+
+Team profile:
+- identity
+- captain
+- squad grouped by unit
+- aggregated stats
+- recent matches
+- tournament history
+
+Matches page:
+- match card summaries only
+
+Match profile:
+- hero summary
+- grouped events
+- lineups
+- shot map
+- shot zones
+- head-to-head
+- full player stats
+
+Rankings:
+- precomputed ranking lists
+- head-to-head comparison summaries
+
+Media:
+- metadata only from DB
+- actual files from object storage/CDN
+
+**How To Store Form**
+Don’t store form as plain text only.
+Store match results normally, then derive form.
+
+But you can cache:
+- `team_form_last_5`
+- `player_form_last_5`
+
+as strings or arrays for fast frontend use.
+
+**How To Handle Records**
+Use a `records_snapshot` table:
+- `record_key`
+- `holder_type`
+- `holder_id`
+- `value`
+- `match_id`
+- `competition_season_id`
+- `calculated_at`
+
+Examples:
+- `most_goals_ever`
+- `highest_match_rating`
+- `longest_win_streak`
+
+**How To Handle Ratings Over Time**
+Store rating per match in `match_player_stats.rating`.
+Then derive:
+- rolling average
+- timeline chart
+- form trend
+
+That is enough. No separate rating-history table needed unless you support manual edits.
+
+**How To Handle Shot Zones**
+Store only raw shot coordinates in `match_shots`.
+Do not store every grid cell by default.
+
+Then derive zone summaries:
+- by match
+- by team
+- by player
+- by season
+
+Example summary table:
+`shot_zone_summary`
+- `scope_type` (`match`, `season`, `team_season`, `player_season`)
+- `scope_id`
+- `team_id`
+- `zone_id`
+- `shots`
+- `goals`
+- `conversion_pct`
+- `top_occupant_player_id`
+
+**Recommended Media Strategy**
+Images:
+- upload originals to object storage
+- generate `thumb`, `medium`, `full`
+- save URLs in DB
+
+Videos:
+- upload original
+- transcode for web
+- generate thumbnail
+- store duration
+- store public streaming URL
+
+MySQL stores metadata only.
+
+**Recommended Integration Architecture**
+Best practical setup for you:
+
+Option A: Separate backend
+- `FastAPI` or `Flask`
+- MySQL behind API
+- frontend fetches API
+
+Option B: Static export
+- Python script runs on schedule
+- pulls MySQL
+- writes `frontend/public/data/*.json`
+- GitHub Pages serves static JSON
+
+If you stay on GitHub Pages, Option B is simpler.
+If you want live filters, search, auth, uploads, voting, admin tools, use Option A.
+
+**Best Folder Responsibility**
+- `backend/`: API or DB access layer
+- `scripts/`: ETL, exports, recompute jobs
+- `data/`: generated JSON snapshots if using static export
+- `assets/` or object storage: media files
+- `frontend/`: UI only
+
+**My Strong Recommendation**
+Use this split:
+
+- raw normalized tables for truth
+- summary tables for expensive widgets
+- object storage for media
+- Python jobs for recompute/export
+- frontend consumes page-shaped JSON
+
+If you want, next I can give you:
+1. a concrete MySQL schema draft,
+2. the exact SQL views you should create,
+3. or the JSON contract the frontend should consume page by page.
