@@ -1,4 +1,5 @@
 from ios_bot.config import *
+from ios_bot.utils.translation import translate_text
 
 @bot.message_command(
     name="Traducir al español",
@@ -16,9 +17,7 @@ async def translate_spanish(ctx, message: discord.Message):
         return
 
     try:
-        translated = await asyncio.to_thread(
-            lambda: GoogleTranslator(source="auto", target="es").translate(original)
-        )
+        translated = await translate_text(original, target="es")
         await ctx.followup.send(translated, ephemeral=True)
     except Exception as e:
         await ctx.followup.send(f"Error: translation failed. ({e})", ephemeral=True)
