@@ -1,24 +1,24 @@
 name: CI
 
 # Lives at the actual repo root (CA-Community-Bot/.github/workflows/) --
-# OfficialCABot/.github/workflows/bot-deploy.yml and hub-pages.yml do not,
-# and a GitHub Actions workflow file only triggers from the exact repo-root
-# .github/workflows/ path. That means those two are very likely not actually
-# running today; this file is deliberately placed correctly so it does.
+# a GitHub Actions workflow file only triggers from the exact repo-root
+# .github/workflows/ path.
+#
+# The Hub (ioscahub.github.io) is its own independent repo with its own
+# remote and its own CI/deploy workflows -- it is intentionally not built
+# or tested here.
 
 on:
   push:
     branches: [main]
     paths:
       - 'OfficialCABot/ios_bot/**'
-      - 'OfficialCABot/ioscahub.github.io/backend/**'
       - 'OfficialCABot/tests/**'
       - 'OfficialCABot/requirements.txt'
       - '.github/workflows/ci.yml'
   pull_request:
     paths:
       - 'OfficialCABot/ios_bot/**'
-      - 'OfficialCABot/ioscahub.github.io/backend/**'
       - 'OfficialCABot/tests/**'
       - 'OfficialCABot/requirements.txt'
       - '.github/workflows/ci.yml'
@@ -54,40 +54,4 @@ jobs:
           print(f"Checked {sum(1 for _ in Path('ios_bot').rglob('*.py'))} files, all OK")
           PY
       - name: Run bot test suite
-        run: python -m pytest tests/ -v
-
-  hub-backend:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: OfficialCABot/ioscahub.github.io/backend
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: pip install -r requirements.txt
-      - name: Syntax-check every Hub backend module
-        run: |
-          python - <<'PY'
-          import ast
-          from pathlib import Path
-          failed = []
-          for path in Path("app").rglob("*.py"):
-              try:
-                  ast.parse(path.read_text(encoding="utf-8-sig"))
-              except SyntaxError as e:
-                  failed.append((path, e))
-          for path, e in failed:
-              print(f"::error file={path}::{e}")
-          if failed:
-              raise SystemExit(f"{len(failed)} file(s) failed to parse")
-          print(f"Checked {sum(1 for _ in Path('app').rglob('*.py'))} files, all OK")
-          PY
-      - name: Confirm the FastAPI app actually imports
-        env:
-          HUB_SESSION_SECRET: ci-placeholder-secret
-          SUPABASE_DB_URL: postgresql://user:pass@localhost:5432/db
-        run: python -c "from app import main; print('main.py imported OK:', main.app)"
-      - name: Run Hub backend test suite
         run: python -m pytest tests/ -v

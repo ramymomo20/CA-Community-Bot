@@ -41,7 +41,8 @@ DEPLOY_EDGE_FUNCTION.md
 parser_match.py
 schema.txt
 
-/scripts
+/scripts/*
+!/scripts/deploy_bot_sftp.py
 /supabase
 /iosca_flask_app
 /csv_output
