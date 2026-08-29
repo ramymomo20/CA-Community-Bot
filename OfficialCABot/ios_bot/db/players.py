@@ -589,6 +589,25 @@ class PlayerOperations:
             logger.error(f"Failed to update player rating: {e}")
             return False
     
+    async def set_player_tier(self, discord_id: int, tier: Optional[str]) -> bool:
+        """Set a player's D1/D2 loan tier ('premier', 'pro', or None to
+        clear it). Staff-assigned only -- there is no automatic derivation
+        from rating (see migrations/2026_08_28_add_player_tier.sql)."""
+        if tier is not None and tier not in ("premier", "pro"):
+            raise ValueError(f"Invalid player tier: {tier!r} (must be 'premier', 'pro', or None)")
+
+        query = "UPDATE IOSCA_PLAYERS SET player_tier = $1, updated_at = CURRENT_TIMESTAMP WHERE discord_id = $2"
+        try:
+            discord_id_value = await self._coerce_discord_id(discord_id)
+            result = await self.pool.execute(query, tier, discord_id_value)
+            updated = bool(result and result.startswith("UPDATE ") and int(result.split()[-1]) > 0)
+            if updated:
+                self.invalidate_ratings_cache()
+            return updated
+        except Exception as e:
+            logger.error(f"Failed to set player tier: {e}")
+            return False
+
     async def get_player_stats(self, discord_id: int) -> Optional[Dict[str, Any]]:
         """Get player statistics including rating"""
         name_column = await self._get_name_column()
