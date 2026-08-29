@@ -287,8 +287,21 @@ async def sign_slash(
     footer_icon = ctx.author.display_avatar.url if ctx.author.display_avatar else None
     public_embed.set_footer(text=f"Requested by {ctx.author.display_name} • {timestamp}", icon_url=footer_icon)
 
-    await ctx.channel.send(embed=public_embed)
-    await refresh_lineup(ctx.channel, force_new_message=True, author_override=ctx.author)
+    try:
+        await ctx.channel.send(embed=public_embed)
+        await refresh_lineup(ctx.channel, force_new_message=True, author_override=ctx.author)
+    except discord.Forbidden:
+        # The sign itself already committed to the DB above -- this only
+        # covers posting the confirmation/lineup here, so tell the user
+        # their sign still went through instead of leaving them with no
+        # feedback at all (and the bot's logs with a bare traceback).
+        await ctx.followup.send(
+            f"✅ Signed **{player_display}** to **{pos}**, but I don't have permission to post or "
+            "update the lineup in this channel. Ask a server admin to check my View Channel / "
+            "Send Messages permissions here.",
+            ephemeral=True,
+        )
+        return
     await ctx.followup.send("✅ Sign completed.", ephemeral=True)
 
     if not text_player and member is None and isinstance(player_obj, discord.Member) and player_obj.id == ctx.author.id:
