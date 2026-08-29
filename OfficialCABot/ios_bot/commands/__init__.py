@@ -33,4 +33,3 @@ from .tournaments import create_tournament, view_tournament
 from .server_assets import server_assets_command
 from .stats_moderation import exclude_match_from_stats, exclude_player_from_match_stats, merge_player
 from .set_position import set_position
-from .set_player_tier import set_player_tier
