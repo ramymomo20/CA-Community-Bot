@@ -2207,8 +2207,19 @@ class TournamentOperations:
                 return None
 
             # Optional strict mode: only auto-link when a confirmed schedule exists
-            # and match time is close to that scheduled slot.
-            if TOURNAMENT_AUTO_SYNC_REQUIRE_CONFIRMED_SCHEDULE:
+            # and match time is close to that scheduled slot. A tournament can
+            # override the global default (see auto_sync_require_confirmed_schedule
+            # in migrations/2026_08_29_add_tournament_autosync_mode.sql) -- fixtures
+            # bulk-imported from an external calendar never get a confirmed
+            # /schedule row, so a straight round-robin league needs this off to
+            # auto-sync at all.
+            tournament_override = tournament.get("auto_sync_require_confirmed_schedule")
+            require_confirmed_schedule = (
+                TOURNAMENT_AUTO_SYNC_REQUIRE_CONFIRMED_SCHEDULE
+                if tournament_override is None
+                else bool(tournament_override)
+            )
+            if require_confirmed_schedule:
                 if not isinstance(match_dt, datetime):
                     return None
                 match_utc = (
