@@ -1462,7 +1462,7 @@ class TournamentOperations:
         forfeiting_guild_id: int,
         winner_guild_id: int,
         created_by: int,
-        score_forfeit: int = 10
+        score_forfeit: int = 7  # matches the 7-goal early-termination rule
     ) -> bool:
         fixture = await self.pool.fetchrow(
             """
@@ -2318,7 +2318,7 @@ class TournamentOperations:
                     COALESCE(f.is_draw_away, FALSE) AS is_draw_away,
                     COALESCE(f.is_forfeit_home, FALSE) AS is_forfeit_home,
                     COALESCE(f.is_forfeit_away, FALSE) AS is_forfeit_away,
-                    COALESCE(f.forfeit_score, 10)::int AS forfeit_score
+                    COALESCE(f.forfeit_score, 7)::int AS forfeit_score
                 FROM TOURNAMENT_FIXTURES f
                 LEFT JOIN IOSCA_TEAMS ht ON ht.guild_id = f.home_guild_id
                 LEFT JOIN IOSCA_TEAMS at ON at.guild_id = f.away_guild_id
