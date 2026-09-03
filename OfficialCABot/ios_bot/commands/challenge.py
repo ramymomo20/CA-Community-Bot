@@ -365,7 +365,14 @@ class ChallengeView(View):
 
     async def on_target_type_selected(self, interaction: discord.Interaction):
         chosen_type_value = interaction.data["values"][0]
-        await interaction.response.defer()
+        try:
+            await interaction.response.defer()
+        except discord.NotFound:
+            # Discord no longer recognizes this interaction token (expired or a
+            # delivery delay on Discord's side) -- every other response path
+            # on this same interaction would fail identically, so there's
+            # nothing left to do but stop instead of crashing.
+            return
 
         # Remove confirm button and specific main channel select if they exist from a previous selection
         if hasattr(self, 'confirm_challenge_button') and self.confirm_challenge_button in self.children:
@@ -511,7 +518,10 @@ class ChallengeView(View):
                 await interaction.edit_original_response(content=f"Multiple Main {self.game_type.upper()} channels found. Please choose one:", view=self)
 
     async def on_team_target_selected(self, interaction: discord.Interaction):
-        await interaction.response.defer()
+        try:
+            await interaction.response.defer()
+        except discord.NotFound:
+            return
         selected_value = interaction.data["values"][0]
         self.selected_target_id = int(selected_value)
 
@@ -531,7 +541,10 @@ class ChallengeView(View):
         )
 
     async def on_specific_main_channel_selected(self, interaction: discord.Interaction):
-        await interaction.response.defer()
+        try:
+            await interaction.response.defer()
+        except discord.NotFound:
+            return
         selected_value = interaction.data["values"][0]
         print(f"[CHALLENGE DEBUG] Selected value: {selected_value}")
         
