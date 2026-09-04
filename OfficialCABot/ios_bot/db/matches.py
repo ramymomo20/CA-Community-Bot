@@ -595,19 +595,16 @@ class MatchOperations:
         aliases = []
         try:
             team_row = await self.pool.fetchrow(
-                "SELECT guild_name, nicknames FROM IOSCA_TEAMS WHERE guild_id = $1",
+                "SELECT guild_name FROM IOSCA_TEAMS WHERE guild_id = $1",
                 guild_id
             )
             if team_row:
                 aliases.append(team_row.get("guild_name"))
-                nicknames = team_row.get("nicknames")
-                if isinstance(nicknames, str):
-                    try:
-                        nicknames = json.loads(nicknames)
-                    except Exception:
-                        nicknames = []
-                if isinstance(nicknames, list):
-                    aliases.extend([n for n in nicknames if n])
+            alias_rows = await self.pool.fetch(
+                "SELECT alias_name FROM TEAM_NAME_ALIASES WHERE guild_id = $1",
+                guild_id
+            )
+            aliases.extend([r["alias_name"] for r in alias_rows if r["alias_name"]])
         except Exception:
             aliases = []
 

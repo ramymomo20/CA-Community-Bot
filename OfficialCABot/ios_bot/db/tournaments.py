@@ -561,11 +561,12 @@ class TournamentOperations:
                 SELECT tt.guild_id,
                        tt.team_name_snapshot as guild_name,
                        tt.league_key,
-                       t.nicknames
+                       ARRAY_AGG(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL) AS aliases
                 FROM TOURNAMENT_TEAMS tt
-                LEFT JOIN IOSCA_TEAMS t
-                  ON tt.guild_id = t.guild_id
+                LEFT JOIN TEAM_NAME_ALIASES a
+                  ON tt.guild_id = a.guild_id
                 WHERE tt.tournament_id = $1
+                GROUP BY tt.guild_id, tt.team_name_snapshot, tt.league_key
                 """,
                 tournament_id
             )
@@ -588,20 +589,13 @@ class TournamentOperations:
                 "guild_name": data.get("guild_name"),
                 "league_key": _normalize_tournament_league_key(data.get("league_key")),
             })
-            try:
-                nicknames = data.get("nicknames")
-                if isinstance(nicknames, str):
-                    nicknames = json.loads(nicknames)
-                if isinstance(nicknames, list):
-                    for name in nicknames:
-                        if name:
-                            candidates.append({
-                                "guild_id": data["guild_id"],
-                                "guild_name": name,
-                                "league_key": _normalize_tournament_league_key(data.get("league_key")),
-                            })
-            except Exception:
-                continue
+            for name in (data.get("aliases") or []):
+                if name:
+                    candidates.append({
+                        "guild_id": data["guild_id"],
+                        "guild_name": name,
+                        "league_key": _normalize_tournament_league_key(data.get("league_key")),
+                    })
         return candidates
 
     def _resolve_team_id_by_name(
