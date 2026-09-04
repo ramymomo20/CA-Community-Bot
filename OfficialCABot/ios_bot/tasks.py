@@ -8,6 +8,7 @@ from ios_bot.signup_manager import (
 )
 from ios_bot.challenge_manager import active_challenges
 from ios_bot.hub_sync_signal import has_pending_request, pending_reason, clear_pending_request
+from ios_bot.db.core_catchup import sync_public_matches_to_core
 from pathlib import Path
 import subprocess
 import sys
@@ -936,6 +937,21 @@ async def sync_hub_incremental():
         clear_pending_request()
         if reason:
             print(f"Hub sync requested early: {reason}")
+
+    if hasattr(bot, "db") and bot.db:
+        try:
+            catchup_result = await sync_public_matches_to_core(bot.db.pool)
+            if catchup_result["matches"] > 0:
+                print(
+                    "Core catch-up: "
+                    f"{catchup_result['matches']} match(es), "
+                    f"{catchup_result['player_entries']} player entries, "
+                    f"{catchup_result['events']} events."
+                )
+            await _record_task_outcome("Core catch-up", success=True)
+        except Exception as e:
+            print(f"Error during core catch-up: {e!r}")
+            await _record_task_outcome("Core catch-up", success=False, error=repr(e))
 
     should_force_full = active_window and _should_force_full_hub_sync(now_utc)
     await _run_hub_sync_once(force_full=should_force_full)
