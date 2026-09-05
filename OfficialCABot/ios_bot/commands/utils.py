@@ -426,9 +426,15 @@ class MoreOptionsView(View):
             await interaction.followup.send("❌ No active challenge found for this channel.", ephemeral=True)
             return
         
-        # If not accepted yet, opponent lineup may not be available
-        if active_challenge_data.get("status") != "accepted":
-            await interaction.followup.send("❌ Opponent lineup is available after the challenge is accepted.", ephemeral=True)
+        # The opponent's channel/identity is already known as soon as the
+        # challenge exists, for every case except one: the initiator's side
+        # of a still-pending broadcast challenge, where nobody has accepted
+        # yet so there genuinely isn't a specific opponent to show.
+        if is_initiator and active_challenge_data.get("status") == "pending_broadcast":
+            await interaction.followup.send(
+                "❌ No team has accepted this broadcast challenge yet, so there's no specific opponent's lineup to show.",
+                ephemeral=True,
+            )
             return
 
         # Get opponent's information
