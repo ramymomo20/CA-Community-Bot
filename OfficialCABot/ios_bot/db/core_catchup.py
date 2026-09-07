@@ -225,3 +225,58 @@ async def sync_public_matches_to_core(pool) -> dict[str, int]:
         "player_entries": len(entry_rows),
         "events": len(event_rows_batch),
     }
+
+
+async def repair_core_match_player_team_links(pool) -> dict[str, int]:
+    """Fix core.match_player_entries rows whose team_id/team_side are still
+    NULL because public.player_match_data.guild_id was NULL at the time
+    they were first migrated, but has since been resolved (typically by
+    ios_bot.db.matches.backfill_player_match_guild_ids running afterward).
+
+    sync_public_matches_to_core only INSERTs new rows (ON CONFLICT DO
+    NOTHING is what makes it safe to call repeatedly and cheaply) -- it
+    never revisits a row it already migrated, so a source-side fix made
+    after that point needs this separate pass to actually reach core.
+    Self-scoping and cheap the same way: the WHERE clause only selects
+    rows that are still broken, so a normal call touches a handful of
+    rows, not the whole table."""
+    guild_to_team = {
+        r["discord_guild_id"]: r["team_id"]
+        for r in await pool.fetch("SELECT discord_guild_id, team_id FROM core.teams")
+    }
+
+    rows = await pool.fetch(
+        """
+        SELECT e.source_player_match_key, p.guild_id, m.home_team_id, m.away_team_id
+        FROM core.match_player_entries e
+        JOIN public.player_match_data p
+          ON e.source_player_match_key = 'legacy:player_match_data:' || p.id
+        JOIN core.matches m ON m.match_id = e.match_id
+        WHERE e.team_id IS NULL AND p.guild_id IS NOT NULL
+        """
+    )
+
+    updates: list[tuple] = []
+    for row in rows:
+        team_id = guild_to_team.get(row["guild_id"])
+        if team_id is None:
+            continue
+        team_side = None
+        if team_id == row["home_team_id"]:
+            team_side = "home"
+        elif team_id == row["away_team_id"]:
+            team_side = "away"
+        updates.append((team_id, team_side, row["source_player_match_key"]))
+
+    if updates:
+        async with pool.acquire() as conn:
+            await conn.executemany(
+                """
+                UPDATE core.match_player_entries
+                SET team_id = $1, team_side = $2
+                WHERE source_player_match_key = $3
+                """,
+                updates,
+            )
+
+    return {"repaired": len(updates)}

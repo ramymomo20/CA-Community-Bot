@@ -8,7 +8,7 @@ from ios_bot.signup_manager import (
 )
 from ios_bot.challenge_manager import active_challenges
 from ios_bot.hub_sync_signal import has_pending_request, pending_reason, clear_pending_request
-from ios_bot.db.core_catchup import sync_public_matches_to_core
+from ios_bot.db.core_catchup import sync_public_matches_to_core, repair_core_match_player_team_links
 from pathlib import Path
 import subprocess
 import sys
@@ -410,6 +410,26 @@ async def _run_hub_sync_once(*, force_full: bool = False) -> dict[str, Any] | No
         if force_full or _should_run_hub_link_backfill():
             try:
                 await bot.db.matches.backfill_match_team_links(threshold=0.8)
+                # Resolving a match's own home/away guild_id here is what
+                # makes backfill_player_match_guild_ids' matches newly
+                # eligible (it requires both sides already resolved) --
+                # run it right after so a player's own guild_id doesn't
+                # keep sitting NULL indefinitely just because nothing ever
+                # revisits it once the match-level link exists.
+                player_backfill_result = await bot.db.matches.backfill_player_match_guild_ids()
+                if player_backfill_result.get("players_updated", 0) > 0:
+                    print(
+                        "Player guild_id backfill: "
+                        f"{player_backfill_result['players_updated']} row(s) fixed across "
+                        f"{player_backfill_result['matches_scanned']} match(es)."
+                    )
+                # The player-level fix above only reaches public.* -- a row
+                # already migrated into core.match_player_entries before
+                # its guild_id was resolved needs this separate repair
+                # pass to pick up the fix (core sync only INSERTs new rows).
+                core_repair_result = await repair_core_match_player_team_links(bot.db.pool)
+                if core_repair_result.get("repaired", 0) > 0:
+                    print(f"Core match_player_entries repair: {core_repair_result['repaired']} row(s) fixed.")
                 hub_link_backfill_last_completed_at = datetime.now(timezone.utc)
             except Exception as backfill_error:
                 print(f"Error backfilling match links before Hub sync: {backfill_error!r}")
